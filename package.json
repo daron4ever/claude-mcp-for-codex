@@ -1,0 +1,31 @@
+{
+  "name": "claude-mcp-for-codex",
+  "version": "0.1.0",
+  "description": "Ask Claude Code from Codex through a local stdio MCP server.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin", "linux"],
+  "bin": {
+    "claude-mcp-for-codex": "dist/index.js"
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "check": "npm run typecheck && npm test",
+    "start": "node dist/index.js",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.31.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  }
+}
