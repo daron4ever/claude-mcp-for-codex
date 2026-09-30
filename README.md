@@ -1,0 +1,188 @@
+# Claude MCP for Codex
+
+A small, open-source MCP server that lets Codex ask **Claude Code** for a second opinion using your existing Claude Code login.
+
+```text
+Codex -> stdio MCP -> Claude Code CLI -> Claude
+      <- answer    <- JSON result   <-
+```
+
+The server exposes one tool, `ask_claude`. Each call starts a fresh, text-only conversation. Supply the question and any sanitized code or context in the prompt. The initial version supports consultation; Claude's tools are disabled.
+
+For code reviews, Claude returns findings and recommendations without editing files or running commands. Codex evaluates those findings and handles separately authorized code changes and validation. Claude receives only the supplied text; Codex must include the sanitized code or diff to be reviewed.
+
+## Requirements
+
+- Node.js 22 or newer.
+- macOS or Linux; Windows users can run the server and Claude Code inside WSL.
+- A separately installed, authenticated [Claude Code CLI](https://code.claude.com/docs/en/overview) supporting the flags listed below, including `--safe-mode`.
+- Codex or another MCP client with stdio support.
+
+Claude Code owns authentication. This project does not implement an API backend, request an API key, install Claude Code, or open a login flow. Run Claude Code yourself to finish its setup before connecting this server. Calls consume usage under your Claude account's applicable limits.
+
+## Build from source
+
+Clone the public repository and enter its directory:
+
+```sh
+git clone https://github.com/daron4ever/claude-mcp-for-codex.git
+cd claude-mcp-for-codex
+```
+
+Run these commands from the cloned repository. OSV Scanner 2.x is needed for the dependency precheck; it is not a runtime dependency. Stop if a scan reports vulnerabilities and assess them before installing.
+
+```sh
+npm install --package-lock-only --ignore-scripts
+node scripts/check-lockfile.mjs
+npm audit
+osv-scanner scan source .
+```
+
+After the prechecks pass:
+
+```sh
+npm ci --ignore-scripts
+npm run check
+```
+
+`npm run check` typechecks, builds, and runs synthetic tests without invoking the real Claude CLI. The executable is `dist/index.js`. This package has not been published to npm; use the local build for now.
+
+## Connect to Codex
+
+Choose user scope (`~/.codex/config.toml`) for all your projects, or project scope (`<project>/.codex/config.toml`) for one trusted project. Project configuration takes precedence over user defaults. See [official OpenAI configuration documentation](https://learn.chatgpt.com/docs/config-file/config-basic).
+
+Add the following table to your chosen Codex configuration, replacing the absolute path with your built checkout. This is a configuration example; the server does not modify Codex configuration itself.
+
+```toml
+[mcp_servers.claude]
+command = "node"
+args = ["/absolute/path/to/claude-mcp-for-codex/dist/index.js"]
+tool_timeout_sec = 130
+
+# Optional defaults; remove these two variables to use Claude runtime defaults.
+[mcp_servers.claude.env]
+CLAUDE_DEFAULT_MODEL = "claude-opus-5-5"
+CLAUDE_DEFAULT_EFFORT = "medium"
+```
+
+Codex supports stdio commands, argument lists, forwarded environment variables, and tool timeouts. See [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+If `node` or `claude` is not on Codex's PATH, use an absolute path for `command`, and merge `CLAUDE_BIN` into the existing MCP environment table:
+
+```toml
+[mcp_servers.claude.env]
+CLAUDE_BIN = "/absolute/path/to/claude"
+```
+
+Restart the Codex session after changing configuration. Confirm Codex recognizes the entry:
+
+```sh
+codex mcp list
+```
+
+Listing the entry confirms configuration discovery; it does not verify Claude authentication or a successful consultation. In the Codex CLI, use `/mcp` to inspect server status, then ask:
+
+> Use ask_claude to explain the tradeoffs in this approach. Include only the sanitized example supplied here.
+
+Or call the tool with:
+
+```json
+{
+  "prompt": "Explain the tradeoffs of an in-memory queue for a single-process worker."
+}
+```
+
+| Input | Behavior |
+| --- | --- |
+| `prompt` | Required nonblank text, at most 100,000 UTF-8 bytes. |
+| `model` | Optional Claude Code alias or model ID; overrides `CLAUDE_DEFAULT_MODEL`. If neither is supplied, Claude Code selects its runtime default. |
+| `effort` | Optional `low`, `medium`, `high`, `xhigh`, or `max`; overrides `CLAUDE_DEFAULT_EFFORT`. If neither is supplied, Claude Code selects the effort. |
+
+Successful calls return Claude's answer as MCP text. Failures set `isError: true` and return a short diagnostic without raw CLI output.
+
+Codex can follow a review policy in your project `AGENTS.md` or user `~/.codex/AGENTS.md`. For example:
+
+```markdown
+## Code reviews
+- When a review is requested, call the Claude MCP tool `ask_claude`.
+- Use model `best` with effort `high` for reviews only.
+- Supply only sanitized code and context. Ask for findings and recommendations only.
+- Codex evaluates the findings and handles fixes under the project's approval rules.
+```
+
+This instruction directs Codex to pass the model and effort as tool arguments. The server does not read `AGENTS.md` itself. Claude Code's `best` alias selects the model that `fable` resolves to when Fable is available to your account, otherwise the same model as `opus`. Alias versions depend on the CLI/provider; use `claude-fable-5-1` when you need that exact version rather than an evolving alias. See [Claude model configuration](https://code.claude.com/docs/en/model-config) and [official OpenAI AGENTS.md documentation](https://learn.chatgpt.com/docs/agent-configuration/agents-md).
+
+Resolve each field independently in this order:
+
+1. Codex passes the applicable `AGENTS.md` choice as a tool argument.
+2. For an omitted argument, the server uses its configured default from `config.toml`.
+3. If both sources omit the field, the server leaves its CLI flag out and Claude Code selects its runtime default under the restricted launch described below.
+
+For example, add these optional defaults to your chosen Codex configuration. Merge them into an existing `[mcp_servers.claude.env]` table if you already have one:
+
+```toml
+[mcp_servers.claude.env]
+CLAUDE_DEFAULT_MODEL = "claude-opus-5-5"
+CLAUDE_DEFAULT_EFFORT = "medium"
+```
+
+Normal consultation calls with no model/effort arguments use Opus 5.5 and medium effort. The review policy above makes Codex pass `best` and `high`, overriding both configured defaults. Supplying only one argument overrides only that field. Directly supplied tool arguments also override the server defaults; the wrapper cannot distinguish arguments chosen from instructions from manually supplied arguments. Invalid supplied arguments fail validation, and invalid configured defaults prevent startup rather than silently falling back.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CLAUDE_BIN` | `claude` | Executable name or path, without extra arguments. |
+| `CLAUDE_TIMEOUT_MS` | `120000` | Request timeout; integer from 1,000 to 600,000 milliseconds. |
+| `CLAUDE_DEFAULT_MODEL` | Unset | Optional model alias or ID used when the tool omits `model`. |
+| `CLAUDE_DEFAULT_EFFORT` | Unset | Optional `low`, `medium`, `high`, `xhigh`, or `max` used when the tool omits `effort`. |
+
+Set Codex's `tool_timeout_sec` longer than this timeout plus the two-second cleanup allowance. No `.env` file is loaded. For an existing login stored in a nonstandard Claude configuration directory, forward your existing `CLAUDE_CONFIG_DIR` through Codex's `env_vars`; the wrapper does not inspect that directory.
+
+## Process and data boundaries
+
+The wrapper spawns the executable directly with `shell: false` and passes the prompt through stdin. Prompts are absent from the command-line arguments. It invokes Claude Code with:
+
+```text
+--print --output-format json
+--safe-mode
+--tools "" --disallowedTools "*"
+--strict-mcp-config --mcp-config '{"mcpServers":{}}'
+--disable-slash-commands --no-session-persistence
+--permission-mode default --setting-sources ""
+--settings '{"disableAllHooks":true}'
+```
+
+The wrapper adds `--model <model>` and `--effort <effort>` only when their fields are supplied by tool arguments or configured defaults. It does not enforce a built-in model or effort fallback. Regular Claude user/project/local settings are disabled by the restricted launch; delegating to Claude defaults does not re-enable those settings. Invalid tool argument values are rejected before launch. Claude Code determines the effective model and effort, and may lower effort to a level supported by the model or allowed by organization policy; the wrapper does not verify those effective selections. See [Claude effort levels](https://code.claude.com/docs/en/model-config#adjust-effort-level). CLI failures are returned without an automatic retry or fallback by this wrapper.
+
+`--safe-mode` skips regular customizations while preserving authentication. `--bare` is intentionally not used: it skips subscription credentials. Built-in and MCP tools are denied. See the [CLI reference](https://code.claude.com/docs/en/cli-reference) and [programmatic use](https://code.claude.com/docs/en/headless).
+
+Only a fixed set of environment variables for executable discovery, local authentication location, locale, proxies, and CA certificates is forwarded. API keys, provider selectors, injected Node options, and unrelated environment secrets are omitted. `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` is set. The wrapper stores no prompts or answers and never logs raw stderr or unsuccessful stdout.
+
+Claude Code remains responsible for its own authentication, network traffic, and local operational state. These flags are not an OS sandbox. Managed organization policy still applies, and managed hooks cannot be disabled by these user-level flags. See [Claude Code hooks](https://code.claude.com/docs/en/hooks#disable-or-remove-hooks). Account administrators remain responsible for managed policy. Only explicitly supplied, sanitized text should be sent: never `.env` contents, secrets, credentials, production exports, or customer data.
+
+Each request has independent state. Cancellation, timeout, and shutdown send SIGTERM to its POSIX process group, then SIGKILL after 500 ms. Cleanup waits at most two seconds and reports failure if the immediate child's close cannot be confirmed. Descendants that deliberately escape the process group are outside this cleanup boundary. Stdout is limited to 1 MiB and stderr to 64 KiB. No automatic retries or session resumption occur.
+
+## Troubleshooting
+
+- **Could not start Claude Code:** install the CLI separately or set `CLAUDE_BIN` to its executable. Shell aliases and `.cmd` wrappers are not supported.
+- **Claude Code failed:** check installation, authentication, model availability, and flag support directly in your terminal. Unsupported flags fail the call; the server never retries with weaker restrictions.
+- **Timed out:** shorten the request or increase `CLAUDE_TIMEOUT_MS` and the MCP client's timeout together.
+- **Invalid or unsuccessful JSON result:** update to a compatible Claude Code CLI and check its behavior locally. Raw error payloads are deliberately not relayed.
+
+Local synthetic tests establish the wrapper's protocol and process behavior. They do not establish login health, model availability, or compatibility with a particular installed Claude Code version. Validate those separately before relying on the integration.
+
+## Development and release
+
+The runtime uses the official MCP TypeScript SDK and Zod. Tests use Node's built-in test runner and an executable fixture created under the ignored `.cache/` directory. CI repeats the checks on macOS and Linux with Node.js 22 and 24.
+
+For dependency changes, resolve the lockfile with scripts disabled, run npm audit and OSV Scanner, inspect changed package sources and install-script metadata, then install only after the checks pass. Keep changes focused and use synthetic test data.
+
+Build and inspect the release package locally:
+
+```sh
+npm run build
+npm pack --ignore-scripts
+```
+
+The GitHub repository is maintained under [daron4ever/claude-mcp-for-codex](https://github.com/daron4ever/claude-mcp-for-codex). npm publication is a separate maintainer action; this package has not been published to npm. This is an independent community project, not an official Anthropic or OpenAI product. It is licensed under MIT; Claude Code remains separately distributed by Anthropic.
