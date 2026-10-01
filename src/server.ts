@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ClaudeRunner, inputSchema } from "./claude.js";
+import { ClaudeRunner, inputSchema, outputSchema } from "./claude.js";
 import type { Config } from "./config.js";
 
 export function createServer(config: Config): {
@@ -19,8 +19,11 @@ export function createServer(config: Config): {
         "Claude receives only the supplied prompt and cannot use tools. " +
         "For reviews, return findings and recommendations; Codex handles code changes. " +
         "Pass model/effort from applicable AGENTS.md guidance to override configured defaults. " +
+        "Successful calls include requested settings and CLI-reported model IDs; " +
+        "effective model and effort remain unverified. " +
         "Each call starts a fresh conversation and consumes Claude usage.",
       inputSchema,
+      outputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -30,8 +33,15 @@ export function createServer(config: Config): {
     },
     async (input, extra) => {
       try {
-        const answer = await runner.run(input, extra.signal);
-        return { content: [{ type: "text", text: answer }] };
+        const result = await runner.run(input, extra.signal);
+        return {
+          content: [
+            { type: "text", text: result.answer },
+            { type: "text", text: "Claude execution metadata (effective settings unverified):\n" +
+              JSON.stringify(result.metadata) },
+          ],
+          structuredContent: result,
+        };
       } catch (error) {
         return {
           isError: true,

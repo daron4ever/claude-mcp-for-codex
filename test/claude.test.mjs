@@ -54,16 +54,16 @@ test("passes literal multiline text through stdin, never through a shell", async
   const { binary } = await fixture(t);
   const runner = makeRunner(t, binary);
   const prompt = "Explain 한국어\n$(touch synthetic-file) `whoami` --resume session";
-  assert.equal(await runner.run({ prompt }, signal()), prompt);
+  assert.equal((await runner.run({ prompt }, signal())).answer, prompt);
 });
 
 test("launches consultation mode with customizations, tools, MCP and persistence disabled", async (t) => {
   const { binary } = await fixture(t);
   const runner = makeRunner(t, binary);
   const prompt = JSON.stringify({ scenario: "inspect" });
-  const inspected = JSON.parse(await runner.run({
+  const inspected = JSON.parse((await runner.run({
     prompt, model: "claude-fable-5-1", effort: "xhigh",
-  }, signal()));
+  }, signal())).answer);
   const args = inspected.args;
   const flag = (name) => args[args.indexOf(name) + 1];
   assert.equal(inspected.prompt, prompt);
@@ -92,7 +92,7 @@ test("concurrent effort selections stay per call and omission delegates to Claud
     ...(effort === undefined ? {} : { effort }),
   }, signal())));
   results.forEach((result, index) => {
-    const { args, prompt } = JSON.parse(result);
+    const { args, prompt } = JSON.parse(result.answer);
     const effort = efforts[index];
     assert.equal(JSON.parse(prompt).effort, effort);
     const effortIndex = args.indexOf("--effort");
@@ -134,7 +134,7 @@ for (const scenario of ["error", "invalid", "invalid-utf8", "envelope-error", "e
       assert.doesNotMatch(error.message, /synthetic-sensitive|partial answer|xxxx/);
       return true;
     });
-    assert.equal(await runner.run({ prompt: "subsequent request works" }, signal()),
+    assert.equal((await runner.run({ prompt: "subsequent request works" }, signal())).answer,
       "subsequent request works");
   });
 }
@@ -172,7 +172,7 @@ test("cancellation terminates an active request and leaves other calls usable", 
   controller.abort();
   await rejected;
   assertExited(assert, pid);
-  assert.equal(await runner.run({ prompt: "another request" }, signal()), "another request");
+  assert.equal((await runner.run({ prompt: "another request" }, signal())).answer, "another request");
 });
 
 test("a descendant holding stdout cannot keep a timed-out request alive", async (t) => {
@@ -189,8 +189,9 @@ test("a descendant holding stdout cannot keep a timed-out request alive", async 
 test("concurrent requests keep answers separate", async (t) => {
   const { binary } = await fixture(t);
   const runner = makeRunner(t, binary);
-  assert.deepEqual(await Promise.all(["first", "second", "third"].map((prompt) =>
-    runner.run({ prompt }, signal()))), ["first", "second", "third"]);
+  const results = await Promise.all(["first", "second", "third"].map((prompt) =>
+    runner.run({ prompt }, signal())));
+  assert.deepEqual(results.map((result) => result.answer), ["first", "second", "third"]);
 });
 
 test("shutdown terminates all active children and prevents new calls", async (t) => {
