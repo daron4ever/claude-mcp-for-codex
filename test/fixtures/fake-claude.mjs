@@ -7,8 +7,8 @@ for await (const chunk of process.stdin) prompt += chunk;
 let request;
 try { request = JSON.parse(prompt); } catch { request = { scenario: "echo" }; }
 
-const success = (result) => JSON.stringify({
-  type: "result", subtype: "success", is_error: false, result,
+const success = (result, fields = {}) => JSON.stringify({
+  type: "result", subtype: "success", is_error: false, result, ...fields,
 });
 const ready = () => {
   if (request.marker) writeFileSync(request.marker, String(process.pid));
@@ -41,7 +41,9 @@ switch (request.scenario) {
   }
   case "error":
     process.stderr.write("synthetic-sensitive-diagnostic");
-    process.stdout.write(success("partial answer must not be returned"));
+    process.stdout.write(success("partial answer must not be returned", {
+      modelUsage: { "claude-opus-5": { sensitive: "synthetic-sensitive-usage" } },
+    }));
     process.exitCode = 1;
     break;
   case "invalid":
@@ -74,6 +76,9 @@ switch (request.scenario) {
       unrelatedSecretPassed: Object.hasOwn(process.env, "SYNTHETIC_SECRET"),
       skipHistory: process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY,
     })));
+    break;
+  case "metadata":
+    process.stdout.write(success("metadata answer", request.fields));
     break;
   default:
     process.stdout.write(success(prompt));

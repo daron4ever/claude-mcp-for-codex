@@ -98,7 +98,27 @@ Or call the tool with:
 | `model` | Optional Claude Code alias or model ID; overrides `CLAUDE_DEFAULT_MODEL`. If neither is supplied, Claude Code selects its runtime default. |
 | `effort` | Optional `low`, `medium`, `high`, `xhigh`, or `max`; overrides `CLAUDE_DEFAULT_EFFORT`. If neither is supplied, Claude Code selects the effort. |
 
-Successful calls return Claude's answer as MCP text. Failures set `isError: true` and return a short diagnostic without raw CLI output.
+Successful calls keep Claude's answer unchanged in the first MCP text block. A second text block contains execution metadata, and `structuredContent` contains both `answer` and `metadata` under the tool's advertised output schema. For example, an `opus`/`high` request might return:
+
+```json
+{
+  "answer": "Claude's answer...",
+  "metadata": {
+    "requestedModel": "opus",
+    "requestedEffort": "high",
+    "cliReportedModelIds": ["claude-opus-5"],
+    "modelUsageStatus": "reported",
+    "effectiveModelVerified": false,
+    "effectiveEffortVerified": false
+  }
+}
+```
+
+`requestedModel` and `requestedEffort` are the values passed to the CLI after tool arguments override configured defaults. `null` means that field was omitted and Claude chooses its default. `cliReportedModelIds` contains only validated identifiers from the CLI's `modelUsage` object; it can include auxiliary models and is not independent proof of the model that produced the answer. The example above is illustrative, not a guarantee of what `opus` resolves to.
+
+`modelUsageStatus` is `reported` when valid IDs are present, `unavailable` when usage is absent or empty, and `invalid` when usage has an unsupported shape or identifiers. Invalid metadata is omitted without discarding a valid answer. Extraction accepts at most 16 model IDs, each matching the supported `claude-...` identifier syntax and the existing 128-character model limit. Usage values, session IDs and unrelated CLI fields are never included in metadata. Both effective-setting verification flags remain `false`; requested settings or CLI-reported usage do not establish independent verification. A strict `AGENTS.md` rule requiring verified effective settings may still require a decision to proceed.
+
+Failures set `isError: true` and return a short diagnostic without raw CLI output or execution metadata.
 
 Codex can follow a review policy in your project `AGENTS.md` or user `~/.codex/AGENTS.md`. For example:
 

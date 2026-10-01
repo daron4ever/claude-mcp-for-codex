@@ -42,6 +42,7 @@ test("stdio MCP handshake, tool discovery, and full consultation flow", async (t
   assert.equal(tools[0].annotations.readOnlyHint, true);
   assert.equal(tools[0].annotations.destructiveHint, false);
   assert.equal(tools[0].annotations.openWorldHint, true);
+  assert.deepEqual(tools[0].outputSchema.required, ["answer", "metadata"]);
   const prompt = JSON.stringify({ scenario: "inspect" });
   const result = await client.callTool({ name: "ask_claude", arguments: {
     prompt, model: "claude-fable-5-1", effort: "xhigh",
@@ -57,6 +58,17 @@ test("stdio MCP handshake, tool discovery, and full consultation flow", async (t
   assert.equal(flag("--tools"), "");
   assert.equal(flag("--disallowedTools"), "*");
   assert.deepEqual(JSON.parse(flag("--mcp-config")), { mcpServers: {} });
+  assert.equal(result.structuredContent.answer, result.content[0].text);
+  assert.deepEqual(result.structuredContent.metadata, {
+    requestedModel: "claude-fable-5-1",
+    requestedEffort: "xhigh",
+    cliReportedModelIds: [],
+    modelUsageStatus: "unavailable",
+    effectiveModelVerified: false,
+    effectiveEffortVerified: false,
+  });
+  assert.deepEqual(JSON.parse(result.content[1].text.split("\n").slice(1).join("\n")),
+    result.structuredContent.metadata);
 });
 
 for (const [name, configuration, defaultModel, defaultEffort] of [
@@ -93,6 +105,10 @@ for (const [name, configuration, defaultModel, defaultEffort] of [
           assert.equal(args.filter((arg) => arg === `--${name}`).length, 1);
         }
       }
+      assert.equal(result.structuredContent.metadata.requestedModel, cases[index].model ?? null);
+      assert.equal(result.structuredContent.metadata.requestedEffort, cases[index].effort ?? null);
+      assert.equal(result.structuredContent.metadata.effectiveModelVerified, false);
+      assert.equal(result.structuredContent.metadata.effectiveEffortVerified, false);
       const flag = (name) => args[args.indexOf(name) + 1];
       assert.equal(flag("--tools"), "");
       assert.equal(flag("--disallowedTools"), "*");
@@ -100,6 +116,94 @@ for (const [name, configuration, defaultModel, defaultEffort] of [
     });
   });
 }
+
+test("MCP exposes only CLI-reported model IDs without claiming verified settings", async (t) => {
+  const { client } = await connect(t);
+  const result = await client.callTool({ name: "ask_claude", arguments: {
+    model: "opus", effort: "high",
+    prompt: JSON.stringify({ scenario: "metadata", fields: {
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 12, private: "synthetic-sensitive-usage" },
+        "claude-haiku-4-5-20251001": { inputTokens: 3 },
+      },
+      effectiveEffort: "low",
+      effectiveModelVerified: true,
+      effectiveEffortVerified: true,
+      session_id: "synthetic-sensitive-session",
+      unrelated: "synthetic-sensitive-field",
+    } }),
+  } });
+  assert.ok(!result.isError);
+  assert.equal(result.content[0].text, "metadata answer");
+  assert.deepEqual(result.structuredContent, {
+    answer: "metadata answer",
+    metadata: {
+      requestedModel: "opus",
+      requestedEffort: "high",
+      cliReportedModelIds: ["claude-opus-5", "claude-haiku-4-5-20251001"],
+      modelUsageStatus: "reported",
+      effectiveModelVerified: false,
+      effectiveEffortVerified: false,
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|inputTokens|effectiveEffort"/);
+  assert.deepEqual(JSON.parse(result.content[1].text.split("\n").slice(1).join("\n")),
+    result.structuredContent.metadata);
+});
+
+test("missing and malformed model usage preserves valid answers without leaking metadata", async (t) => {
+  const { client } = await connect(t);
+  const cases = [
+    { fields: {}, status: "unavailable" },
+    { fields: { modelUsage: {} }, status: "unavailable" },
+    ...[null, [], 1, "synthetic-sensitive-metadata",
+      { "synthetic-sensitive-key": {} },
+      { "claude-opus-5": "synthetic-sensitive-value" },
+      { "claude-opus-5": null },
+      { "claude-opus-5": [] },
+      { "claude-opus-5\n": {} },
+      { "claude-opus-5": {}, "bad model id": {} },
+      { ["claude-" + "x".repeat(128)]: {} },
+      Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`claude-model-${i}`, {}])),
+    ].map((modelUsage) => ({ fields: { modelUsage }, status: "invalid" })),
+  ];
+  for (const { fields, status } of cases) {
+    const result = await client.callTool({ name: "ask_claude", arguments: {
+      prompt: JSON.stringify({ scenario: "metadata", fields }),
+    } });
+    assert.ok(!result.isError);
+    assert.equal(result.content[0].text, "metadata answer");
+    assert.deepEqual(result.structuredContent.metadata, {
+      requestedModel: null,
+      requestedEffort: null,
+      cliReportedModelIds: [],
+      modelUsageStatus: status,
+      effectiveModelVerified: false,
+      effectiveEffortVerified: false,
+    });
+    assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|bad model id/);
+  }
+});
+
+test("concurrent calls keep CLI model usage and request settings separate", async (t) => {
+  const { client } = await connect(t);
+  const calls = [
+    { model: "opus", effort: "high", id: "claude-opus-5" },
+    { model: "sonnet", effort: "medium", id: "claude-sonnet-4-5" },
+  ];
+  const results = await Promise.all(calls.map(({ model, effort, id }) => client.callTool({
+    name: "ask_claude", arguments: {
+      model, effort,
+      prompt: JSON.stringify({ scenario: "metadata", fields: { modelUsage: { [id]: {} } } }),
+    },
+  })));
+  results.forEach((result, i) => {
+    assert.ok(!result.isError);
+    assert.equal(result.structuredContent.metadata.requestedModel, calls[i].model);
+    assert.equal(result.structuredContent.metadata.requestedEffort, calls[i].effort);
+    assert.deepEqual(result.structuredContent.metadata.cliReportedModelIds, [calls[i].id]);
+  });
+});
 
 test("MCP rejects invalid input and surfaces sanitized CLI errors", async (t) => {
   const { client } = await connect(t, {
@@ -123,6 +227,8 @@ test("MCP rejects invalid input and surfaces sanitized CLI errors", async (t) =>
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /Claude Code failed/);
   assert.doesNotMatch(result.content[0].text, /synthetic-sensitive|partial answer/);
+  assert.equal(result.structuredContent, undefined);
+  assert.equal(result.content.length, 1);
 });
 
 test("invalid configured defaults prevent MCP startup without exposing their values", async (t) => {

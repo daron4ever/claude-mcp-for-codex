@@ -2,6 +2,7 @@
 
 ## 0.1.0 - Unreleased
 
+- Preserve answer text while adding requested model/effort, sanitized CLI-reported model IDs and explicit unverified effective-setting flags in text and structured MCP responses.
 - Add a local stdio MCP server exposing `ask_claude` through the Claude Code CLI.
 - Use existing CLI authentication and disable tool access and regular customization discovery for consultation calls.
 - Add bounded process cleanup, safe errors, synthetic MCP tests, and a macOS/Linux CI workflow.

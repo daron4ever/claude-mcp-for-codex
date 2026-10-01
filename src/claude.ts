@@ -22,12 +22,40 @@ export const inputSchema = z.object({
 
 export type ClaudeInput = z.infer<typeof inputSchema>;
 
+const reportedModelIdSchema = modelSchema
+  .regex(/^claude-[a-zA-Z0-9][a-zA-Z0-9._:-]*$/)
+  .refine((id) => id.trim() === id);
+
+export const outputSchema = z.object({
+  answer: z.string().min(1),
+  metadata: z.object({
+    requestedModel: modelSchema.nullable()
+      .describe("Model passed to the CLI after argument/default precedence; null means CLI default."),
+    requestedEffort: effortSchema.nullable()
+      .describe("Effort passed to the CLI; this does not verify effective effort."),
+    cliReportedModelIds: z.array(reportedModelIdSchema).max(16)
+      .describe("CLI modelUsage keys, which may include auxiliary models; not independent attestation."),
+    modelUsageStatus: z.enum(["reported", "unavailable", "invalid"]),
+    effectiveModelVerified: z.literal(false),
+    effectiveEffortVerified: z.literal(false),
+  }),
+});
+
+export type ClaudeResult = z.infer<typeof outputSchema>;
+
 const resultSchema = z.object({
   type: z.literal("result"),
   subtype: z.literal("success"),
   is_error: z.literal(false),
   result: z.string().min(1),
+  modelUsage: z.unknown().optional(),
 });
+
+// Return only bounded model identifiers, never usage values or other CLI fields.
+const modelUsageSchema = z.record(
+  reportedModelIdSchema,
+  z.object({}),
+).refine((usage) => Object.keys(usage).length <= 16);
 
 const MAX_STDOUT_BYTES = 1_048_576;
 const MAX_STDERR_BYTES = 65_536;
@@ -65,7 +93,7 @@ function invokeClaude(
   config: Config,
   input: ClaudeInput,
   signal: AbortSignal,
-): Promise<string> {
+): Promise<ClaudeResult> {
   if (signal.aborted) return Promise.reject(new Error("Claude request cancelled."));
   const model = input.model ?? config.defaultModel;
   const effort = input.effort ?? config.defaultEffort;
@@ -96,7 +124,7 @@ function invokeClaude(
     let graceTimer: NodeJS.Timeout | undefined;
     let cleanupTimer: NodeJS.Timeout | undefined;
 
-    const finish = (answer?: string): void => {
+    const finish = (result?: ClaudeResult): void => {
       if (settled) return;
       settled = true;
       clearTimeout(requestTimer);
@@ -104,7 +132,7 @@ function invokeClaude(
       clearTimeout(cleanupTimer);
       signal.removeEventListener("abort", onAbort);
       if (failure) reject(failure);
-      else if (answer !== undefined) resolve(answer);
+      else if (result !== undefined) resolve(result);
       else reject(new Error("Claude Code returned no answer."));
     };
 
@@ -174,12 +202,28 @@ function invokeClaude(
         stop("Claude Code failed. Check its installation, login, and supported flags locally.");
         return;
       }
-      let answer: string;
+      let result: ClaudeResult;
       try {
         const json: unknown = JSON.parse(
           new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(stdout)),
         );
-        answer = resultSchema.parse(json).result;
+        const parsed = resultSchema.parse(json);
+        const usage = modelUsageSchema.safeParse(parsed.modelUsage);
+        const modelIds = usage.success ? Object.keys(usage.data) : [];
+        let modelUsageStatus: ClaudeResult["metadata"]["modelUsageStatus"] = "unavailable";
+        if (parsed.modelUsage !== undefined && !usage.success) modelUsageStatus = "invalid";
+        else if (modelIds.length > 0) modelUsageStatus = "reported";
+        result = {
+          answer: parsed.result,
+          metadata: {
+            requestedModel: model ?? null,
+            requestedEffort: effort ?? null,
+            cliReportedModelIds: modelIds,
+            modelUsageStatus,
+            effectiveModelVerified: false,
+            effectiveEffortVerified: false,
+          },
+        };
       } catch {
         stop("Claude Code returned an invalid or unsuccessful JSON result.");
         return;
@@ -187,7 +231,7 @@ function invokeClaude(
       // Consultation mode should not leave background processes. Clear any
       // remaining members of the dedicated process group before returning.
       kill("SIGKILL");
-      finish(answer);
+      finish(result);
     });
 
     signal.addEventListener("abort", onAbort, { once: true });
@@ -198,11 +242,11 @@ function invokeClaude(
 
 export class ClaudeRunner {
   private readonly shutdown = new AbortController();
-  private readonly pending = new Set<Promise<string>>();
+  private readonly pending = new Set<Promise<ClaudeResult>>();
 
   constructor(private readonly config: Config) {}
 
-  async run(input: ClaudeInput, signal: AbortSignal): Promise<string> {
+  async run(input: ClaudeInput, signal: AbortSignal): Promise<ClaudeResult> {
     const validated = inputSchema.parse(input);
     const request = invokeClaude(
       this.config, validated, AbortSignal.any([signal, this.shutdown.signal]),
