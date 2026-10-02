@@ -157,6 +157,63 @@ relevant context may help large consultations; this workflow has not been shown 
 resolve intermittent timeouts and does not verify applied model or effort. A
 separate semantic index is optional infrastructure, not required for this flow.
 
+## Keep long Claude responses available
+
+Codex can truncate oversized tool output before its model reads it. Increasing
+the [tool-output budget](https://learn.chatgpt.com/docs/config-file/config-reference)
+gives headroom, but does not retain an omitted answer.
+
+When your Codex client exposes Code Mode with
+[`store` and `load`](https://github.com/openai/codex/blob/44dd77b71e88c78295736bffd3dc3b684c13be6d/codex-rs/code-mode-protocol/src/description.rs#L23-L44),
+use this caller workflow for an authorized consultation:
+
+1. Discover and validate the live Claude tool definition. Send only approved,
+   minimized, sanitized context and the applicable model/effort arguments.
+2. Call Claude through Code Mode and store the complete returned result under
+   a distinct key before printing anything. Print only that key, success/error
+   status, answer size, and the execution metadata.
+3. Load the retained result in later cells and print bounded answer sections.
+   Account for UTF-8 size, JSON escaping and the active output budget; a fixed
+   character count is not a guaranteed token bound. If a section is truncated,
+   read a smaller section from the same retained result.
+4. Track coverage and read all relevant sections before presenting Claude's
+   conclusions. Label any incomplete assessment. Retrieving a section does
+   not require another Claude call.
+5. Keep requested settings, CLI-reported usage and effective-setting evidence
+   separate. This workflow does not verify applied effort or waive your
+   consultation, review or access requirements.
+
+```text
+Before: Claude -> direct tool output -> client budget -> omitted sections
+
+After:  Claude -> Code Mode store -> bounded reads -> Codex assessment
+```
+
+The retained result belongs to the current Code Mode session. Do not assume it
+survives a restart, compaction, or client recovery unless the client documents
+and verifies that behavior. This workflow does not retrospectively recover a
+previous direct call. Do not write responses to disk without approval.
+
+If Code Mode, `store` or `load` is unavailable, request a concise assessment and
+use the documented tool-output budget when supported by your installed Codex
+version. Report incomplete output; do not silently repeat a paid consultation.
+
+To adopt this workflow, copy the following guidance into your applicable
+`AGENTS.md`. The server does not automatically retain results or load it.
+
+```markdown
+## Retain Claude consultation results
+- For an authorized Claude consultation, when Code Mode store/load is available,
+  retain the complete result under a distinct session key before printing it.
+- Print bounded status/metadata, then load and read answer sections within the
+  active output budget. Read all relevant sections before assessing findings.
+- Retrieve missing sections from the retained result rather than calling Claude
+  again. If retention or output coverage is unavailable, disclose the limitation.
+- Preserve existing access, sanitation, model/effort verification, consultation,
+  formal-review and implementation-approval requirements. Do not persist answers
+  to files without approval.
+```
+
 ## Execution metadata and failures
 
 Successful calls keep Claude's answer unchanged in the first MCP text block. A second text block contains execution metadata, and `structuredContent` contains both `answer` and `metadata` under the tool's advertised output schema. For example, an `opus`/`high` request might return:

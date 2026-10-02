@@ -2,6 +2,7 @@
 
 ## 0.1.0 - Unreleased
 
+- Document optional Codex Code Mode result retention and bounded reads for long Claude responses, with session-lifetime and verification limitations.
 - Document an opt-in Codex-led context-selection workflow with reusable AGENTS.md guidance and a synthetic prompt example; preserve tool-free Claude consultation and explicit context/verification limits.
 - Add sanitized per-call failure timing, configured deadline, output byte counts and initial exit/close observations, with a separately labeled cleanup outcome; preserve short errors and never return partial assessments.
 - Preserve answer text while adding requested model/effort, sanitized CLI-reported model IDs and explicit unverified effective-setting flags in text and structured MCP responses.
