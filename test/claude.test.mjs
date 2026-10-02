@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { resolve } from "node:path";
-import { ClaudeRunner, inputSchema } from "../dist/claude.js";
+import { ClaudeExecutionError, ClaudeRunner, inputSchema } from "../dist/claude.js";
 import { readConfig } from "../dist/config.js";
 import { fixture, waitForMarker, assertExited } from "./helpers.mjs";
 
@@ -121,7 +121,16 @@ test("invalid effort is rejected before attempting to start Claude Code", async 
 test("missing executable produces a safe actionable failure", async (t) => {
   const { directory } = await fixture(t);
   const runner = makeRunner(t, resolve(directory, "missing"));
-  await assert.rejects(runner.run({ prompt: "hi" }, signal()), /Could not start Claude Code/);
+  await assert.rejects(runner.run({ prompt: "hi" }, signal()), (error) => {
+    assert.match(error.message, /Could not start Claude Code/);
+    assert.ok(error instanceof ClaudeExecutionError);
+    assert.equal(error.diagnostics.failureCategory, "spawn");
+    assert.equal(error.diagnostics.exitObserved, false);
+    assert.equal(error.diagnostics.closeObserved, false);
+    assert.equal(error.diagnostics.stdoutBytes, 0);
+    assert.doesNotMatch(JSON.stringify(error.diagnostics), /missing|synthetic/);
+    return true;
+  });
 });
 
 for (const scenario of ["error", "invalid", "invalid-utf8", "envelope-error", "empty",
@@ -132,6 +141,11 @@ for (const scenario of ["error", "invalid", "invalid-utf8", "envelope-error", "e
     await assert.rejects(runner.run({ prompt: JSON.stringify({ scenario }) }, signal()), (error) => {
       assert.match(error.message, /Claude/);
       assert.doesNotMatch(error.message, /synthetic-sensitive|partial answer|xxxx/);
+      assert.ok(error instanceof ClaudeExecutionError);
+      assert.doesNotMatch(JSON.stringify(error.diagnostics), /synthetic-sensitive|partial answer|xxxx/);
+      assert.equal(error.diagnostics.failureCategory,
+        scenario === "error" ? "cli_exit" : scenario === "stdout-overflow" ? "stdout_limit" :
+          scenario === "stderr-overflow" ? "stderr_limit" : "invalid_result");
       return true;
     });
     assert.equal((await runner.run({ prompt: "subsequent request works" }, signal())).answer,
@@ -147,13 +161,37 @@ test("already cancelled requests do not start the executable", async (t) => {
   await assert.rejects(runner.run({ prompt: "hi" }, controller.signal), /cancelled/);
 });
 
-for (const scenario of ["hang", "ignore-term"]) {
+for (const scenario of ["hang", "ignore-term", "output-hang"]) {
   test(`timeout terminates ${scenario} child before returning`, async (t) => {
     const { binary, directory } = await fixture(t);
     const runner = makeRunner(t, binary, 1_000);
     const marker = resolve(directory, "ready");
     const request = runner.run({ prompt: JSON.stringify({ scenario, marker }) }, signal());
-    const rejected = assert.rejects(request, /timed out/);
+    const rejected = assert.rejects(request, (error) => {
+      assert.ok(error instanceof ClaudeExecutionError);
+      assert.equal(error.message, "Claude request timed out.");
+      const diagnostics = error.diagnostics;
+      assert.equal(diagnostics.failureCategory, "timeout");
+      assert.equal(diagnostics.timeoutMs, 1_000);
+      assert.ok(diagnostics.elapsedMs >= 1_000);
+      assert.equal(diagnostics.exitObserved, false);
+      assert.equal(diagnostics.exitCode, null);
+      assert.equal(diagnostics.exitSignal, null);
+      assert.equal(diagnostics.closeObserved, false);
+      assert.equal(diagnostics.cleanupStatus, "close_observed");
+      if (scenario === "output-hang") {
+        assert.ok(diagnostics.stdoutBytes > 0);
+        assert.ok(diagnostics.stderrBytes > 0);
+        assert.ok(diagnostics.firstStdoutMs >= 0);
+        assert.ok(diagnostics.firstStdoutMs <= diagnostics.elapsedMs);
+      } else {
+        assert.equal(diagnostics.stdoutBytes, 0);
+        assert.equal(diagnostics.stderrBytes, 0);
+        assert.equal(diagnostics.firstStdoutMs, null);
+      }
+      assert.doesNotMatch(JSON.stringify(diagnostics), /synthetic-sensitive|partial answer/);
+      return true;
+    });
     const pid = await waitForMarker(marker);
     await rejected;
     assertExited(assert, pid);
@@ -181,9 +219,72 @@ test("a descendant holding stdout cannot keep a timed-out request alive", async 
   const marker = resolve(directory, "ready");
   const rejected = assert.rejects(runner.run({ prompt: JSON.stringify({
     scenario: "descendant", marker,
-  }) }, signal()), /timed out/);
+  }) }, signal()), (error) => {
+    assert.equal(error.message, "Claude request timed out.");
+    assert.equal(error.diagnostics.failureCategory, "timeout");
+    assert.equal(error.diagnostics.exitObserved, true);
+    assert.equal(error.diagnostics.exitCode, 0);
+    assert.equal(error.diagnostics.exitSignal, null);
+    assert.equal(error.diagnostics.closeObserved, false);
+    assert.ok(error.diagnostics.stdoutBytes > 0);
+    assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+    return true;
+  });
   await waitForMarker(marker);
   await rejected;
+});
+
+test("cleanup failure retains the initial boundary instead of a wrapper-induced exit", async (t) => {
+  const { binary, directory } = await fixture(t);
+  const runner = makeRunner(t, binary);
+  const marker = resolve(directory, "ready");
+  const controller = new AbortController();
+  const request = runner.run({ prompt: JSON.stringify({ scenario: "hang", marker }) },
+    controller.signal);
+  const rejected = assert.rejects(request, (error) => {
+    assert.equal(error.message, "Claude process cleanup could not be confirmed.");
+    assert.equal(error.diagnostics.failureCategory, "cancelled");
+    assert.equal(error.diagnostics.exitObserved, false);
+    assert.equal(error.diagnostics.exitSignal, null);
+    assert.equal(error.diagnostics.closeObserved, false);
+    assert.equal(error.diagnostics.cleanupStatus, "unconfirmed");
+    return true;
+  });
+  const pid = await waitForMarker(marker);
+  const originalKill = process.kill;
+  const mock = t.mock.method(process, "kill", function (target, signalName) {
+    if (target === -pid && signalName === "SIGTERM") {
+      throw Object.assign(new Error("synthetic-sensitive failure"), { code: "EPERM" });
+    }
+    return originalKill.call(process, target, signalName);
+  });
+  controller.abort();
+  mock.mock.restore();
+  await rejected;
+  assertExited(assert, pid);
+});
+
+test("cleanup failure after normal close discards the answer and reports the cleanup boundary", async (t) => {
+  const { binary } = await fixture(t);
+  const runner = makeRunner(t, binary);
+  const originalKill = process.kill;
+  t.mock.method(process, "kill", function (target, signalName) {
+    if (target < 0 && signalName === "SIGKILL") {
+      throw Object.assign(new Error("synthetic-sensitive failure"), { code: "EPERM" });
+    }
+    return originalKill.call(process, target, signalName);
+  });
+  await assert.rejects(runner.run({ prompt: "synthetic-sensitive answer" }, signal()), (error) => {
+    assert.equal(error.message, "Claude process cleanup could not be confirmed.");
+    assert.equal(error.diagnostics.failureCategory, "cleanup");
+    assert.equal(error.diagnostics.exitObserved, true);
+    assert.equal(error.diagnostics.exitCode, 0);
+    assert.equal(error.diagnostics.exitSignal, null);
+    assert.equal(error.diagnostics.closeObserved, true);
+    assert.equal(error.diagnostics.cleanupStatus, "unconfirmed");
+    assert.doesNotMatch(JSON.stringify(error), /synthetic-sensitive/);
+    return true;
+  });
 });
 
 test("concurrent requests keep answers separate", async (t) => {

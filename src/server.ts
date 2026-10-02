@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ClaudeRunner, inputSchema, outputSchema } from "./claude.js";
+import { ClaudeExecutionError, ClaudeRunner, inputSchema, outputSchema } from "./claude.js";
 import type { Config } from "./config.js";
 
 export function createServer(config: Config): {
@@ -43,10 +43,20 @@ export function createServer(config: Config): {
           structuredContent: result,
         };
       } catch (error) {
+        const content: Array<{ type: "text"; text: string }> = [{
+          type: "text",
+          text: error instanceof Error ? error.message : "Claude request failed.",
+        }];
+        if (error instanceof ClaudeExecutionError) {
+          content.push({
+            type: "text",
+            text: "Claude failure diagnostics (initial state before cleanup):\n" +
+              JSON.stringify(error.diagnostics),
+          });
+        }
         return {
           isError: true,
-          content: [{ type: "text", text: error instanceof Error
-            ? error.message : "Claude request failed." }],
+          content,
         };
       }
     },

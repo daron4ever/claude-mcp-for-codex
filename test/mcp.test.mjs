@@ -226,9 +226,53 @@ test("MCP rejects invalid input and surfaces sanitized CLI errors", async (t) =>
   } });
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /Claude Code failed/);
-  assert.doesNotMatch(result.content[0].text, /synthetic-sensitive|partial answer/);
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|partial answer/);
   assert.equal(result.structuredContent, undefined);
-  assert.equal(result.content.length, 1);
+  assert.equal(result.content.length, 2);
+  const diagnostics = JSON.parse(result.content[1].text.split("\n").slice(1).join("\n"));
+  assert.equal(diagnostics.failureCategory, "cli_exit");
+  assert.equal(diagnostics.exitObserved, true);
+  assert.equal(diagnostics.exitCode, 1);
+  assert.equal(diagnostics.exitSignal, null);
+  assert.equal(diagnostics.closeObserved, true);
+  assert.equal(diagnostics.cleanupStatus, "close_observed");
+});
+
+test("MCP failures report per-call deadlines and never return partial assessments", async (t) => {
+  const { client } = await connect(t, { CLAUDE_TIMEOUT_MS: "1000" });
+  const scenarios = ["hang", "output-hang", "descendant"];
+  const results = await Promise.all(scenarios.map((scenario) => client.callTool({
+    name: "ask_claude", arguments: {
+      prompt: JSON.stringify({ scenario }), model: "opus", effort: "high",
+    },
+  })));
+  results.forEach((result, i) => {
+    assert.equal(result.isError, true);
+    assert.equal(result.content[0].text, "Claude request timed out.");
+    assert.equal(result.structuredContent, undefined);
+    assert.equal(result.content.length, 2);
+    assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|partial answer|answer before/);
+    const diagnostics = JSON.parse(result.content[1].text.split("\n").slice(1).join("\n"));
+    assert.deepEqual(Object.keys(diagnostics).sort(), [
+      "failureCategory", "elapsedMs", "timeoutMs", "firstStdoutMs", "stdoutBytes",
+      "stderrBytes", "exitObserved", "exitCode", "exitSignal", "closeObserved", "cleanupStatus",
+    ].sort());
+    assert.equal(diagnostics.failureCategory, "timeout");
+    assert.equal(diagnostics.timeoutMs, 1_000);
+    assert.ok(diagnostics.elapsedMs >= 1_000);
+    assert.equal(diagnostics.closeObserved, false);
+    assert.equal(diagnostics.cleanupStatus, "close_observed");
+    assert.equal(diagnostics.exitObserved, scenarios[i] === "descendant");
+    assert.equal(diagnostics.exitCode, scenarios[i] === "descendant" ? 0 : null);
+    assert.equal(diagnostics.exitSignal, null);
+    assert.equal(diagnostics.stdoutBytes === 0, scenarios[i] === "hang");
+    assert.equal(diagnostics.stderrBytes > 0, scenarios[i] === "output-hang");
+  });
+  const success = await client.callTool({ name: "ask_claude", arguments: { prompt: "still usable" } });
+  assert.equal(success.content[0].text, "still usable");
+  assert.equal(success.structuredContent.metadata.effectiveModelVerified, false);
+  assert.equal(success.structuredContent.metadata.effectiveEffortVerified, false);
+  assert.doesNotMatch(JSON.stringify(success), /failureCategory|cleanupStatus/);
 });
 
 test("invalid configured defaults prevent MCP startup without exposing their values", async (t) => {
