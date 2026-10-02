@@ -179,7 +179,29 @@ Successful calls keep Claude's answer unchanged in the first MCP text block. A s
 
 `modelUsageStatus` is `reported` when valid IDs are present, `unavailable` when usage is absent or empty, and `invalid` when usage has an unsupported shape or identifiers. Invalid metadata is omitted without discarding a valid answer. Extraction accepts at most 16 model IDs, each matching the supported `claude-...` identifier syntax and the existing 128-character model limit. Usage values, session IDs and unrelated CLI fields are never included in metadata. Both effective-setting verification flags remain `false`; requested settings or CLI-reported usage do not establish independent verification. A strict `AGENTS.md` rule requiring verified effective settings may still require a decision to proceed.
 
-Failures set `isError: true` and return a short diagnostic without raw CLI output or execution metadata.
+Failures set `isError: true` and keep the short error message in the first text block. Failures after CLI launch add a second text block labeled `Claude failure diagnostics (initial state before cleanup):`, followed by JSON such as:
+
+```json
+{
+  "failureCategory": "timeout",
+  "elapsedMs": 300004,
+  "timeoutMs": 300000,
+  "firstStdoutMs": null,
+  "stdoutBytes": 0,
+  "stderrBytes": 0,
+  "exitObserved": false,
+  "exitCode": null,
+  "exitSignal": null,
+  "closeObserved": false,
+  "cleanupStatus": "close_observed"
+}
+```
+
+This is an illustrative timeout, not a runtime measurement. `elapsedMs` uses a monotonic clock from launch to the initial failure, excluding cleanup; `timeoutMs` is the configured deadline in that running server. `firstStdoutMs` is the first received stdout time from launch, or `null` when none arrived. Byte counts describe output received before failure, not its content or validity. `exitObserved`, `exitCode`, `exitSignal` and `closeObserved` describe the initial failure boundary **before** wrapper termination; null exit fields alone do not establish that the CLI was still running. An observed exit with no close can indicate still-open stdio pipes. Output bytes do not establish a completed assessment or identify a network/model issue.
+
+`failureCategory` records the first wrapper boundary: `timeout`, `cancelled`, `spawn`, `stdin`, `stdout`, `stderr`, `stdout_limit`, `stderr_limit`, `cli_exit`, `invalid_result` or `cleanup`. `cleanupStatus` separately describes the final cleanup observation: `close_observed` means the immediate child closed and no process-group signaling failure was observed; `unconfirmed` means cleanup could not be confirmed. It does not attest to descendants outside the process group. A cleanup failure can replace the first error message while retaining the original category and snapshot.
+
+Failure diagnostics contain no prompts, paths, settings, raw CLI output, partial answers or model/effort verification claims. Error responses do not include successful execution metadata or `structuredContent`. Input validation and cancellation before launch can return only the short message. A client/transport timeout that prevents the server response from arriving cannot carry these diagnostics.
 
 Codex can follow a review policy in your project `AGENTS.md` or user `~/.codex/AGENTS.md`. For example:
 
@@ -248,7 +270,7 @@ Each request has independent state. Cancellation, timeout, and shutdown send SIG
 
 - **Could not start Claude Code:** install the CLI separately or set `CLAUDE_BIN` to its executable. Shell aliases and `.cmd` wrappers are not supported.
 - **Claude Code failed:** check installation, authentication, model availability, and flag support directly in your terminal. Unsupported flags fail the call; the server never retries with weaker restrictions.
-- **Timed out:** shorten the request or increase `CLAUDE_TIMEOUT_MS` and the MCP client's timeout together.
+- **Timed out:** inspect the failure diagnostics' actual `timeoutMs`, elapsed time and initial exit/close observations. These identify the wrapper boundary, not its root cause. If changing `CLAUDE_TIMEOUT_MS`, also leave the MCP client's timeout longer than the deadline plus cleanup, then restart the MCP connection to load the change. A client timeout or stale running server requires separate evidence.
 - **Invalid or unsuccessful JSON result:** update to a compatible Claude Code CLI and check its behavior locally. Raw error payloads are deliberately not relayed.
 
 Local synthetic tests establish the wrapper's protocol and process behavior. They do not establish login health, model availability, or compatibility with a particular installed Claude Code version. Validate those separately before relying on the integration.

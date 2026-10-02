@@ -15,6 +15,12 @@ const ready = () => {
 };
 
 switch (request.scenario) {
+  case "output-hang":
+    process.stdout.write(success("synthetic-sensitive partial answer"));
+    process.stderr.write("synthetic-sensitive diagnostics");
+    ready();
+    setInterval(() => {}, 1000);
+    break;
   case "hang":
     ready();
     setInterval(() => {}, 1000);

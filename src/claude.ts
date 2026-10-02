@@ -43,6 +43,30 @@ export const outputSchema = z.object({
 
 export type ClaudeResult = z.infer<typeof outputSchema>;
 
+type FailureCategory = "timeout" | "cancelled" | "spawn" | "stdin" | "stdout" |
+  "stderr" | "stdout_limit" | "stderr_limit" | "cli_exit" | "invalid_result" | "cleanup";
+
+export type ClaudeFailureDiagnostics = {
+  failureCategory: FailureCategory;
+  elapsedMs: number;
+  timeoutMs: number;
+  firstStdoutMs: number | null;
+  stdoutBytes: number;
+  stderrBytes: number;
+  exitObserved: boolean;
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+  closeObserved: boolean;
+  cleanupStatus: "close_observed" | "unconfirmed";
+};
+
+export class ClaudeExecutionError extends Error {
+  constructor(message: string, readonly diagnostics: ClaudeFailureDiagnostics) {
+    super(message);
+    this.name = "ClaudeExecutionError";
+  }
+}
+
 const resultSchema = z.object({
   type: z.literal("result"),
   subtype: z.literal("success"),
@@ -99,6 +123,7 @@ function invokeClaude(
   const effort = input.effort ?? config.defaultEffort;
 
   return new Promise((resolve, reject) => {
+    const startedAt = performance.now();
     const child = spawn(
       config.binary,
       [
@@ -120,9 +145,32 @@ function invokeClaude(
     let closed = false;
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    let firstStdoutMs: number | null = null;
+    let exitObserved = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    let failureSnapshot: Omit<ClaudeFailureDiagnostics, "cleanupStatus"> | undefined;
+    let cleanupUnconfirmed = false;
     const stdout: Buffer[] = [];
     let graceTimer: NodeJS.Timeout | undefined;
     let cleanupTimer: NodeJS.Timeout | undefined;
+
+    // Freeze the initial boundary before cleanup changes process state.
+    const recordFailure = (failureCategory: FailureCategory): void => {
+      if (failureSnapshot !== undefined) return;
+      failureSnapshot = {
+        failureCategory,
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        timeoutMs: config.timeoutMs,
+        firstStdoutMs,
+        stdoutBytes,
+        stderrBytes,
+        exitObserved,
+        exitCode,
+        exitSignal,
+        closeObserved: closed,
+      };
+    };
 
     const finish = (result?: ClaudeResult): void => {
       if (settled) return;
@@ -131,8 +179,13 @@ function invokeClaude(
       clearTimeout(graceTimer);
       clearTimeout(cleanupTimer);
       signal.removeEventListener("abort", onAbort);
-      if (failure) reject(failure);
-      else if (result !== undefined) resolve(result);
+      if (failure) {
+        reject(failureSnapshot === undefined ? failure : new ClaudeExecutionError(
+          failure.message,
+          { ...failureSnapshot,
+            cleanupStatus: cleanupUnconfirmed || !closed ? "unconfirmed" : "close_observed" },
+        ));
+      } else if (result !== undefined) resolve(result);
       else reject(new Error("Claude Code returned no answer."));
     };
 
@@ -141,12 +194,15 @@ function invokeClaude(
       try {
         signalGroup(child.pid, signalName);
       } catch {
+        recordFailure("cleanup");
+        cleanupUnconfirmed = true;
         failure = new Error("Claude process cleanup could not be confirmed.");
       }
     };
 
-    const stop = (message: string): void => {
+    const stop = (message: string, category: FailureCategory): void => {
       if (failure || settled) return;
+      recordFailure(category);
       failure = new Error(message);
       stdout.length = 0;
       kill("SIGTERM");
@@ -157,6 +213,7 @@ function invokeClaude(
       cleanupTimer = setTimeout(() => {
         kill("SIGKILL");
         if (!closed) {
+          cleanupUnconfirmed = true;
           failure = new Error("Claude process cleanup could not be confirmed.");
           child.stdin.destroy();
           child.stdout.destroy();
@@ -166,28 +223,40 @@ function invokeClaude(
       }, CLEANUP_DEADLINE_MS);
     };
 
-    const onAbort = (): void => stop("Claude request cancelled.");
+    const onAbort = (): void => stop("Claude request cancelled.", "cancelled");
     const requestTimer = setTimeout(
-      () => stop("Claude request timed out."), config.timeoutMs,
+      () => stop("Claude request timed out.", "timeout"), config.timeoutMs,
     );
 
     child.once("error", () => {
-      stop("Could not start Claude Code. Install it or set CLAUDE_BIN to its executable.");
+      stop("Could not start Claude Code. Install it or set CLAUDE_BIN to its executable.", "spawn");
     });
-    child.stdin.on("error", () => stop("Could not send the prompt to Claude Code."));
-    child.stdout.on("error", () => stop("Could not read the Claude Code response."));
-    child.stderr.on("error", () => stop("Could not read Claude Code diagnostics."));
+    child.stdin.on("error", () => stop("Could not send the prompt to Claude Code.", "stdin"));
+    child.stdout.on("error", () => stop("Could not read the Claude Code response.", "stdout"));
+    child.stderr.on("error", () => stop("Could not read Claude Code diagnostics.", "stderr"));
+
+    child.once("exit", (code, signalName) => {
+      exitObserved = true;
+      exitCode = code;
+      exitSignal = signalName;
+    });
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (failure) return;
+      if (firstStdoutMs === null) {
+        firstStdoutMs = Math.max(0, Math.round(performance.now() - startedAt));
+      }
       stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) stop("Claude response exceeded the 1 MiB limit.");
-      else stdout.push(chunk);
+      if (stdoutBytes > MAX_STDOUT_BYTES) {
+        stop("Claude response exceeded the 1 MiB limit.", "stdout_limit");
+      } else stdout.push(chunk);
     });
     child.stderr.on("data", (chunk: Buffer) => {
       if (failure) return;
       stderrBytes += chunk.length;
-      if (stderrBytes > MAX_STDERR_BYTES) stop("Claude diagnostics exceeded the 64 KiB limit.");
+      if (stderrBytes > MAX_STDERR_BYTES) {
+        stop("Claude diagnostics exceeded the 64 KiB limit.", "stderr_limit");
+      }
     });
 
     child.once("close", (code, exitSignal) => {
@@ -199,7 +268,8 @@ function invokeClaude(
         return;
       }
       if (code !== 0 || exitSignal !== null) {
-        stop("Claude Code failed. Check its installation, login, and supported flags locally.");
+        stop("Claude Code failed. Check its installation, login, and supported flags locally.",
+          "cli_exit");
         return;
       }
       let result: ClaudeResult;
@@ -225,7 +295,7 @@ function invokeClaude(
           },
         };
       } catch {
-        stop("Claude Code returned an invalid or unsuccessful JSON result.");
+        stop("Claude Code returned an invalid or unsuccessful JSON result.", "invalid_result");
         return;
       }
       // Consultation mode should not leave background processes. Clear any
