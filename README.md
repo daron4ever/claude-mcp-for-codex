@@ -98,6 +98,67 @@ Or call the tool with:
 | `model` | Optional Claude Code alias or model ID; overrides `CLAUDE_DEFAULT_MODEL`. If neither is supplied, Claude Code selects its runtime default. |
 | `effort` | Optional `low`, `medium`, `high`, `xhigh`, or `max`; overrides `CLAUDE_DEFAULT_EFFORT`. If neither is supplied, Claude Code selects the effort. |
 
+## Select context before consulting Claude
+
+Use Codex's existing code-navigation tools to gather relevant context before calling
+`ask_claude`. This workflow uses the current `prompt` argument; the server does not
+search files, maintain an index, or automatically load these instructions. To adopt
+it, add the guidance below to your applicable `AGENTS.md`.
+
+```text
+Before: Codex -> question + caller-assembled context -> Claude MCP
+
+After:  Codex -> find authorized source -> select and sanitize snippets
+              -> bounded prompt -> Claude MCP -> assessment
+              -> Codex checks evidence and handles approved changes
+```
+
+```markdown
+## Context for Claude consultations
+- Apply this workflow only when a Claude consultation is already authorized.
+  Preserve the project's consultation and formal-review rules.
+- State the decision, expected behavior and relevant constraints. Independently
+  analyze the evidence before reading Claude's response.
+- Use existing code-navigation tools within approved access. Read the named
+  function and relevant callers, state owners or tests; do not send whole files
+  when selected excerpts provide enough context.
+- Send only minimized, sanitized source excerpts. Never include credentials,
+  .env contents, customer data, production exports or raw production logs.
+  Automated filtering alone does not establish that context is safe to share.
+- Label excerpts with project-relative paths and original line numbers. State
+  which revision or working-tree state they describe. Label redactions and gaps;
+  snippets must not imply that omitted code was inspected or is absent.
+- Keep the complete prompt within 100000 UTF-8 bytes, including the question,
+  labels and constraints. Reduce irrelevant context explicitly; never silently
+  truncate. If necessary evidence cannot fit or cannot safely be shared, report
+  the limitation and request a narrower decision or additional authorization.
+- Supply the applicable model and effort choices as tool arguments. Treat
+  requested settings, CLI-reported models and verified settings separately;
+  honor any rule requiring verified effective settings before relying on Claude.
+- Ask Claude for findings, tradeoffs and uncertainty using only supplied context.
+  Codex checks the claims against source and handles separately approved edits.
+  Missing context requires further evidence, not automatic retries or acceptance.
+```
+
+For example, this valid tool request contains only a synthetic excerpt. Its model
+and effort are illustrative; use the choices required by your own instructions.
+
+```json
+{
+  "prompt": "Decision: assess cancellation risks in this synthetic worker. Expected behavior: cancellation stops work. Context state: synthetic example, no repository revision. Evidence: worker.js lines 1-4:\n1 export async function run(job, signal) {\n2   if (signal.aborted) throw new Error('cancelled');\n3   return await job();\n4 }\nCoverage: job implementation and callers are not supplied; do not assume their behavior. Return findings, tradeoffs and uncertainty only. Do not edit files or run tools.",
+  "model": "opus",
+  "effort": "high"
+}
+```
+
+The wrapper validates the prompt's size and shape, but cannot establish that it is
+sanitized, sufficient or correctly attributed. Codex owns those checks. Smaller,
+relevant context may help large consultations; this workflow has not been shown to
+resolve intermittent timeouts and does not verify applied model or effort. A
+separate semantic index is optional infrastructure, not required for this flow.
+
+## Execution metadata and failures
+
 Successful calls keep Claude's answer unchanged in the first MCP text block. A second text block contains execution metadata, and `structuredContent` contains both `answer` and `metadata` under the tool's advertised output schema. For example, an `opus`/`high` request might return:
 
 ```json
