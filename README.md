@@ -105,11 +105,17 @@ Use Codex's existing code-navigation tools to gather relevant context before cal
 search files, maintain an index, or automatically load these instructions. To adopt
 it, add the guidance below to your applicable `AGENTS.md`.
 
+Include the current task's progress as well as relevant code. Each Claude call
+starts fresh: a task number or a file path alone does not supply earlier work.
+Codex prepares the task snapshot and includes it in the existing `prompt`; Claude
+does not read the task registry or remember previous calls automatically.
+
 ```text
 Before: Codex -> question + caller-assembled context -> Claude MCP
 
-After:  Codex -> find authorized source -> select and sanitize snippets
-              -> bounded prompt -> Claude MCP -> assessment
+After:  current task record + authorized source
+              -> Codex refreshes and sanitizes task snapshot + snippets
+              -> bounded prompt -> fresh Claude MCP call -> assessment
               -> Codex checks evidence and handles approved changes
 ```
 
@@ -119,6 +125,19 @@ After:  Codex -> find authorized source -> select and sanitize snippets
   Preserve the project's consultation and formal-review rules.
 - State the decision, expected behavior and relevant constraints. Independently
   analyze the evidence before reading Claude's response.
+- Before each authorized call, refresh the relevant task state from its current
+  task record and authorized source. If there is no task record, use confirmed
+  conversation facts and label unknowns; do not invent progress or decisions.
+- Include the task identity, goal, approved scope, current step, completed work,
+  remaining work and the specific question Claude should assess. Distinguish
+  executed validation and its results from planned or unverified checks.
+- Include settled requirements, approved decisions and their reasons. Label
+  earlier Claude recommendations as advisory and state whether they were adopted,
+  rejected or remain unresolved. Do not send raw conversation transcripts or
+  Codex's tentative conclusions and preferred answer.
+- Identify the source revision or working-tree state and changes since the last
+  consultation. Supply the complete relevant current snapshot on every call;
+  a task ID, previous-call reference or change-only update is insufficient.
 - Use existing code-navigation tools within approved access. Read the named
   function and relevant callers, state owners or tests; do not send whole files
   when selected excerpts provide enough context.
@@ -138,21 +157,28 @@ After:  Codex -> find authorized source -> select and sanitize snippets
 - Ask Claude for findings, tradeoffs and uncertainty using only supplied context.
   Codex checks the claims against source and handles separately approved edits.
   Missing context requires further evidence, not automatic retries or acceptance.
+- When the answer arrives, check it against the latest task and source state.
+  Reconcile stale assumptions before using the advice; do not automatically
+  repeat the call. Record concise adopted recommendations and reconciliation
+  reasons in the existing task record, without copying the transcript.
 ```
 
-For example, this valid tool request contains only a synthetic excerpt. Its model
-and effort are illustrative; use the choices required by your own instructions.
+For example, this valid tool request supplies a synthetic task snapshot and code
+excerpt. The task, progress and decisions below are illustrative, not results
+from this repository. Use the model and effort required by your own instructions.
 
 ```json
 {
-  "prompt": "Decision: assess cancellation risks in this synthetic worker. Expected behavior: cancellation stops work. Context state: synthetic example, no repository revision. Evidence: worker.js lines 1-4:\n1 export async function run(job, signal) {\n2   if (signal.aborted) throw new Error('cancelled');\n3   return await job();\n4 }\nCoverage: job implementation and callers are not supplied; do not assume their behavior. Return findings, tradeoffs and uncertainty only. Do not edit files or run tools.",
+  "prompt": "Task snapshot: synthetic example, task #3.\nGoal: cancellation stops this worker. Approved scope: cancellation behavior only; no unrelated changes.\nCurrent step: assess behavior when cancellation arrives during job execution.\nCompleted work: added the pre-start cancellation check shown below. Validation: no checks have been executed in this example.\nRemaining work: establish the job's cancellation contract, implement any approved correction, and validate the affected flow.\nSettled decision: Codex owns edits; Claude provides advice only. Prior Claude advice: none.\nChanges since the previous consultation: first consultation. Source state: synthetic excerpt, no repository revision.\nEvidence: worker.js lines 1-4:\n1 export async function run(job, signal) {\n2   if (signal.aborted) throw new Error('cancelled');\n3   return await job();\n4 }\nCoverage: job implementation and callers are not supplied; do not assume their behavior.\nQuestion: what evidence is needed to assess cancellation during job execution? Return findings, options and uncertainty using only supplied context. Do not edit files or run tools.",
   "model": "opus",
   "effort": "high"
 }
 ```
 
 The wrapper validates the prompt's size and shape, but cannot establish that it is
-sanitized, sufficient or correctly attributed. Codex owns those checks. Smaller,
+sanitized, sufficient, current or correctly attributed. Codex owns those checks.
+Adopting this guidance supplies task continuity through updated prompts; it adds
+no server-side memory, automatic file loading or session resumption. Smaller,
 relevant context may help large consultations; this workflow has not been shown to
 resolve intermittent timeouts and does not verify applied model or effort. A
 separate semantic index is optional infrastructure, not required for this flow.
