@@ -4,7 +4,7 @@ A small, open-source MCP server that lets Codex ask **Claude Code** for a second
 
 ```text
 Codex -> stdio MCP -> Claude Code CLI -> Claude
-      <- answer    <- JSON result   <-
+      <- answer    <- JSON stream   <-
 ```
 
 The server exposes one tool, `ask_claude`. Each call starts a fresh, text-only conversation. Supply the question and any sanitized code or context in the prompt. The initial version supports consultation; Claude's tools are disabled.
@@ -16,6 +16,8 @@ For code reviews, Claude returns findings and recommendations without editing fi
 - Node.js 22 or newer.
 - macOS or Linux; Windows users can run the server and Claude Code inside WSL.
 - A separately installed, authenticated [Claude Code CLI](https://code.claude.com/docs/en/overview) supporting the flags listed below, including `--safe-mode`.
+- Native stream-json initialization support; CLI-applied verification also needs the
+  `get_settings` control response with applied model and effort.
 - Codex or another MCP client with stdio support.
 
 Claude Code owns authentication. This project does not implement an API backend, request an API key, install Claude Code, or open a login flow. Run Claude Code yourself to finish its setup before connecting this server. Calls consume usage under your Claude account's applicable limits.
@@ -242,7 +244,10 @@ To adopt this workflow, copy the following guidance into your applicable
 
 ## Execution metadata and failures
 
-Successful calls keep Claude's answer unchanged in the first MCP text block. A second text block contains execution metadata, and `structuredContent` contains both `answer` and `metadata` under the tool's advertised output schema. For example, an `opus`/`high` request might return:
+Successful calls keep Claude's answer unchanged in the first MCP text block. A second
+text block names the CLI-applied evidence status and includes execution metadata.
+`structuredContent` contains the same `answer` and `metadata` under the advertised
+output schema. An illustrative `opus`/`high` call with complete evidence returns:
 
 ```json
 {
@@ -250,23 +255,85 @@ Successful calls keep Claude's answer unchanged in the first MCP text block. A s
   "metadata": {
     "requestedModel": "opus",
     "requestedEffort": "high",
-    "cliReportedModelIds": ["claude-opus-5"],
+    "cliReportedModelIds": ["claude-haiku-4-5-20251001", "claude-opus-5-5"],
     "modelUsageStatus": "reported",
-    "effectiveModelVerified": false,
-    "effectiveEffortVerified": false
+    "effectiveModelVerified": true,
+    "effectiveEffortVerified": true,
+    "settingsEvidence": {
+      "scope": "cli_applied_session",
+      "status": "verified",
+      "before": { "model": "claude-opus-5-5", "effort": "high" },
+      "after": { "model": "claude-opus-5-5", "effort": "high" },
+      "answerModelIds": ["claude-opus-5-5"],
+      "sessionCorrelated": true,
+      "requestedModelMatch": "alias_unchecked",
+      "requestedEffortMatched": true,
+      "providerAttested": false,
+      "reasoningAllocationVerified": false
+    }
   }
 }
 ```
 
-`requestedModel` and `requestedEffort` are the values passed to the CLI after tool arguments override configured defaults. `null` means that field was omitted and Claude chooses its default. `cliReportedModelIds` contains only validated identifiers from the CLI's `modelUsage` object; it can include auxiliary models and is not independent proof of the model that produced the answer. The example above is illustrative, not a guarantee of what `opus` resolves to.
+The `effective*Verified` flags now mean **answer-correlated CLI-applied session
+settings**, within `settingsEvidence.scope`. They require successful native
+initialization, matched before/after `get_settings` responses, valid stable applied
+model and effort, matching main-assistant model(s), and consistent internal init,
+main-assistant and result session IDs. Main-answer evidence requires explicit root
+attribution (`parent_tool_use_id: null`), an assistant role, supported content
+blocks and a nonblank text block. Valid thinking blocks may precede the text
+answer; thinking alone does not establish answer evidence. Missing or malformed
+envelopes leave verification false. Flags are computed by the wrapper; values
+supplied in an answer, result metadata or aggregate usage cannot establish them.
+The wrapper returns only after normal process exit, close and group cleanup.
 
-`modelUsageStatus` is `reported` when valid IDs are present, `unavailable` when usage is absent or empty, and `invalid` when usage has an unsupported shape or identifiers. Invalid metadata is omitted without discarding a valid answer. Extraction accepts at most 16 model IDs, each matching the supported `claude-...` identifier syntax and the existing 128-character model limit. Usage values, session IDs and unrelated CLI fields are never included in metadata. Both effective-setting verification flags remain `false`; requested settings or CLI-reported usage do not establish independent verification. A strict `AGENTS.md` rule requiring verified effective settings may still require a decision to proceed.
+```text
+initialize -> settings before -> one prompt -> main answer/result
+           -> settings after -> correlate -> EOF/exit/cleanup -> MCP response
+```
+
+This is independent of the model's textual claims, but **not provider-side
+per-request attestation**. It does not establish internal reasoning allocation or
+that a silent inference-stage effort cap is reflected in the readback. Both
+`providerAttested` and `reasoningAllocationVerified` remain `false`. A policy that
+requires provider-effective settings beyond CLI-applied evidence remains
+unsatisfied; callers must apply their own verification policy before relying on
+an assessment.
+
+`requestedModel` and `requestedEffort` are passed values after argument/default
+precedence; `null` delegates to Claude defaults. The CLI owns alias resolution:
+`alias_unchecked` reports that an alias was supplied without claiming the wrapper
+independently knows its latest version or mapping. `cli_default` means the model
+flag was omitted. A supplied full `claude-...` ID is compared literally (`exact`
+or `different`); unavailable readback yields `unavailable`. Supplied effort is
+compared with the before-readback, or `null` when not supplied/unavailable. A full
+ID or effort mismatch prevents verification. The example is not a guarantee of
+what `opus` resolves to for every account or CLI version.
+
+`settingsEvidence.status` is `verified`, `unavailable` for missing fields or
+unsupported readback, `invalid` for malformed evidence, or `mismatch` for
+contradictory settings, sessions, answer models or explicit selections. Only
+allowlisted model/effort pairs are returned in `before`/`after`; unavailable or
+invalid snapshots are `null`. Main-answer IDs are distinct from aggregate usage.
+A structurally valid answer is preserved on evidence-only failure with both flags
+`false`; this does not authorize strict callers to rely on it. Broken control
+ordering, unsuccessful results, transport failures or cleanup failures return
+errors without an answer. Unsupported readback never triggers a retry or a
+second inference request.
+
+`modelUsageStatus` separately describes aggregate usage: `reported` for valid
+nonempty IDs, `unavailable` for absent/empty usage, and `invalid` for unsupported
+shape or IDs. Malformed usage does not invalidate otherwise valid settings
+evidence or answer text. Extraction accepts at most 16 `claude-...` IDs of up to
+128 characters; auxiliary models may appear here. Usage values, raw session IDs,
+full settings, error payloads and unrelated CLI fields are never returned.
 
 Failures set `isError: true` and keep the short error message in the first text block. Failures after CLI launch add a second text block labeled `Claude failure diagnostics (initial state before cleanup):`, followed by JSON such as:
 
 ```json
 {
   "failureCategory": "timeout",
+  "phase": "initialize",
   "elapsedMs": 300004,
   "timeoutMs": 300000,
   "firstStdoutMs": null,
@@ -282,7 +349,12 @@ Failures set `isError: true` and keep the short error message in the first text 
 
 This is an illustrative timeout, not a runtime measurement. `elapsedMs` uses a monotonic clock from launch to the initial failure, excluding cleanup; `timeoutMs` is the configured deadline in that running server. `firstStdoutMs` is the first received stdout time from launch, or `null` when none arrived. Byte counts describe output received before failure, not its content or validity. `exitObserved`, `exitCode`, `exitSignal` and `closeObserved` describe the initial failure boundary **before** wrapper termination; null exit fields alone do not establish that the CLI was still running. An observed exit with no close can indicate still-open stdio pipes. Output bytes do not establish a completed assessment or identify a network/model issue.
 
-`failureCategory` records the first wrapper boundary: `timeout`, `cancelled`, `spawn`, `stdin`, `stdout`, `stderr`, `stdout_limit`, `stderr_limit`, `cli_exit`, `invalid_result` or `cleanup`. `cleanupStatus` separately describes the final cleanup observation: `close_observed` means the immediate child closed and no process-group signaling failure was observed; `unconfirmed` means cleanup could not be confirmed. It does not attest to descendants outside the process group. A cleanup failure can replace the first error message while retaining the original category and snapshot.
+`phase` records the native lifecycle boundary: `initialize`, `settings_before`,
+`inference`, `settings_after`, or `closing`. It locates the wait; it does not
+establish why the CLI stalled.
+
+`failureCategory` records the first wrapper boundary: `timeout`, `cancelled`, `spawn`, `stdin`, `stdout`, `stderr`, `stdout_limit`, `stderr_limit`, `cli_exit`, `invalid_result`, `protocol` or `cleanup`. `protocol` covers broken control/event
+sequencing, premature close and unsupported operation requests. `cleanupStatus` separately describes the final cleanup observation: `close_observed` means the immediate child closed and no process-group signaling failure was observed; `unconfirmed` means cleanup could not be confirmed. It does not attest to descendants outside the process group. A cleanup failure can replace the first error message while retaining the original category and snapshot.
 
 Failure diagnostics contain no prompts, paths, settings, raw CLI output, partial answers or model/effort verification claims. Error responses do not include successful execution metadata or `structuredContent`. Input validation and cancellation before launch can return only the short message. A client/transport timeout that prevents the server response from arriving cannot carry these diagnostics.
 
@@ -330,7 +402,7 @@ Set Codex's `tool_timeout_sec` longer than this timeout plus the two-second clea
 The wrapper spawns the executable directly with `shell: false` and passes the prompt through stdin. Prompts are absent from the command-line arguments. It invokes Claude Code with:
 
 ```text
---print --output-format json
+--print --input-format stream-json --output-format stream-json --verbose
 --safe-mode
 --tools "" --disallowedTools "*"
 --strict-mcp-config --mcp-config '{"mcpServers":{}}'
@@ -339,7 +411,8 @@ The wrapper spawns the executable directly with `shell: false` and passes the pr
 --settings '{"disableAllHooks":true}'
 ```
 
-The wrapper adds `--model <model>` and `--effort <effort>` only when their fields are supplied by tool arguments or configured defaults. It does not enforce a built-in model or effort fallback. Regular Claude user/project/local settings are disabled by the restricted launch; delegating to Claude defaults does not re-enable those settings. Invalid tool argument values are rejected before launch. Claude Code determines the effective model and effort, and may lower effort to a level supported by the model or allowed by organization policy; the wrapper does not verify those effective selections. See [Claude effort levels](https://code.claude.com/docs/en/model-config#adjust-effort-level). CLI failures are returned without an automatic retry or fallback by this wrapper.
+The wrapper adds `--model <model>` and `--effort <effort>` only when their fields are supplied by tool arguments or configured defaults. It does not enforce a built-in model or effort fallback. Regular Claude user/project/local settings are disabled by the restricted launch; delegating to Claude defaults does not re-enable those settings. Invalid tool argument values are rejected before launch. Claude Code determines the effective model and effort, and may lower effort to a level supported by the model or allowed by organization policy; the wrapper checks CLI-applied answering-session settings as described above,
+without attesting to provider-side execution or reasoning allocation. See [Claude effort levels](https://code.claude.com/docs/en/model-config#adjust-effort-level). CLI failures are returned without an automatic retry or fallback by this wrapper.
 
 `--safe-mode` skips regular customizations while preserving authentication. `--bare` is intentionally not used: it skips subscription credentials. Built-in and MCP tools are denied. See the [CLI reference](https://code.claude.com/docs/en/cli-reference) and [programmatic use](https://code.claude.com/docs/en/headless).
 
@@ -347,13 +420,21 @@ Only a fixed set of environment variables for executable discovery, local authen
 
 Claude Code remains responsible for its own authentication, network traffic, and local operational state. These flags are not an OS sandbox. Managed organization policy still applies, and managed hooks cannot be disabled by these user-level flags. See [Claude Code hooks](https://code.claude.com/docs/en/hooks#disable-or-remove-hooks). Account administrators remain responsible for managed policy. Only explicitly supplied, sanitized text should be sent: never `.env` contents, secrets, credentials, production exports, or customer data.
 
-Each request has independent state. Cancellation, timeout, and shutdown send SIGTERM to its POSIX process group, then SIGKILL after 500 ms. Cleanup waits at most two seconds and reports failure if the immediate child's close cannot be confirmed. Descendants that deliberately escape the process group are outside this cleanup boundary. Stdout is limited to 1 MiB and stderr to 64 KiB. No automatic retries or session resumption occur.
+Each request has independent state. Cancellation, timeout, and shutdown send SIGTERM to its POSIX process group, then SIGKILL after 500 ms. Cleanup waits at most two seconds and reports failure if the immediate child's close cannot be confirmed. Descendants that deliberately escape the process group are outside this cleanup boundary. The single request deadline covers initialization, both readbacks, inference and
+process close. Stdout is limited to 1 MiB cumulatively across all control and
+answer frames, and stderr to 64 KiB. Verbose frames repeat answer content, so
+the largest answer that fits can be smaller than with final JSON output. No automatic retries or session resumption occur.
 
 ## Troubleshooting
 
 - **Could not start Claude Code:** install the CLI separately or set `CLAUDE_BIN` to its executable. Shell aliases and `.cmd` wrappers are not supported.
 - **Claude Code failed:** check installation, authentication, model availability, and flag support directly in your terminal. Unsupported flags fail the call; the server never retries with weaker restrictions.
-- **Timed out:** inspect the failure diagnostics' actual `timeoutMs`, elapsed time and initial exit/close observations. These identify the wrapper boundary, not its root cause. If changing `CLAUDE_TIMEOUT_MS`, also leave the MCP client's timeout longer than the deadline plus cleanup, then restart the MCP connection to load the change. A client timeout or stale running server requires separate evidence.
+- **Timed out:** inspect the failure diagnostics' `phase`, actual `timeoutMs`, elapsed time and initial exit/close observations. These identify the wrapper boundary, not its root cause. If changing `CLAUDE_TIMEOUT_MS`, also leave the MCP client's timeout longer than the deadline plus cleanup, then restart the MCP connection to load the change. A client timeout or stale running server requires separate evidence.
+- **Unverified CLI-applied settings:** inspect `settingsEvidence.status` and the
+  sanitized snapshots; update Claude Code if native readback is unsupported.
+  Follow your verification policy instead of assuming requested settings applied.
+- **Native protocol failure:** use a compatible Claude Code CLI. Unexpected control
+  requests and broken sequencing fail without approving tools or retrying.
 - **Invalid or unsuccessful JSON result:** update to a compatible Claude Code CLI and check its behavior locally. Raw error payloads are deliberately not relayed.
 
 Local synthetic tests establish the wrapper's protocol and process behavior. They do not establish login health, model availability, or compatibility with a particular installed Claude Code version. Validate those separately before relying on the integration.

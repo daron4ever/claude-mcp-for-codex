@@ -19,8 +19,10 @@ export function createServer(config: Config): {
         "Claude receives only the supplied prompt and cannot use tools. " +
         "For reviews, return findings and recommendations; Codex handles code changes. " +
         "Pass model/effort from applicable AGENTS.md guidance to override configured defaults. " +
-        "Successful calls include requested settings and CLI-reported model IDs; " +
-        "effective model and effort remain unverified. " +
+        "Successful calls include requested settings, aggregate model IDs and " +
+        "answer-correlated CLI-applied settings evidence. Verification flags cover " +
+        "only CLI-applied session settings, not provider attestation or reasoning allocation. " +
+        "Missing or mismatched evidence leaves the answer unverified. " +
         "Each call starts a fresh conversation and consumes Claude usage.",
       inputSchema,
       outputSchema,
@@ -37,7 +39,8 @@ export function createServer(config: Config): {
         return {
           content: [
             { type: "text", text: result.answer },
-            { type: "text", text: "Claude execution metadata (effective settings unverified):\n" +
+            { type: "text", text: "Claude execution metadata (CLI-applied settings " +
+              result.metadata.settingsEvidence.status + "; provider attestation unavailable):\n" +
               JSON.stringify(result.metadata) },
           ],
           structuredContent: result,

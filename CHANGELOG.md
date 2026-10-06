@@ -2,6 +2,10 @@
 
 ## 0.1.0 - Unreleased
 
+- Read native CLI-applied model/effort before and after each answer, correlate main-answer models and sessions, and scope verification flags explicitly to CLI-applied session evidence; provider attestation and reasoning allocation remain unverified. Preserve valid answers with false flags for unavailable, invalid or mismatched evidence.
+- Require valid root-assistant attribution, role and answer-bearing content before verifying CLI-applied settings; malformed or thinking-only evidence cannot establish verification.
+- Use bounded native stream-json control messages while preserving one prompt per process, tool restrictions, cancellation and cleanup; add safe protocol-phase failure diagnostics and controlled correlation/lifecycle regressions. The existing 1 MiB stdout cap now includes all verbose/control frames.
+
 - Extend the opt-in context workflow with refreshed task snapshots, evidence and decision history, plus a synthetic request example; keep Claude stateless and read-only.
 - Document optional Codex Code Mode result retention and bounded reads for long Claude responses, with session-lifetime and verification limitations.
 - Document an opt-in Codex-led context-selection workflow with reusable AGENTS.md guidance and a synthetic prompt example; preserve tool-free Claude consultation and explicit context/verification limits.
