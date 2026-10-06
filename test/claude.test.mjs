@@ -17,7 +17,10 @@ test("configuration defaults and boundary validation", () => {
   assert.deepEqual(readConfig({}), { binary: "claude", timeoutMs: 120_000 });
   assert.deepEqual(readConfig({ CLAUDE_BIN: "/synthetic/claude", CLAUDE_TIMEOUT_MS: "1000" }),
     { binary: "/synthetic/claude", timeoutMs: 1000 });
-  for (const value of ["", "0", "999", "600001", "10x", "Infinity"]) {
+  for (const value of ["600000", "600001", "1200000"]) {
+    assert.equal(readConfig({ CLAUDE_TIMEOUT_MS: value }).timeoutMs, Number(value));
+  }
+  for (const value of ["", "0", "999", "1200001", "10x", "Infinity"]) {
     assert.throws(() => readConfig({ CLAUDE_TIMEOUT_MS: value }), /Invalid configuration/);
   }
   assert.throws(() => readConfig({ CLAUDE_BIN: " " }), /Invalid configuration/);

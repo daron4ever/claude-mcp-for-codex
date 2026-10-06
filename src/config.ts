@@ -12,7 +12,7 @@ const configSchema = z.object({
     .string()
     .regex(/^\d+$/)
     .transform(Number)
-    .pipe(z.number().int().min(1_000).max(600_000))
+    .pipe(z.number().int().min(1_000).max(1_200_000))
     .default(120_000),
   CLAUDE_DEFAULT_MODEL: modelSchema.optional(),
   CLAUDE_DEFAULT_EFFORT: effortSchema.optional(),
@@ -35,7 +35,7 @@ export function readConfig(env: NodeJS.ProcessEnv): Config {
   if (!result.success) {
     throw new Error(
       "Invalid configuration. CLAUDE_BIN must be an executable name or path; " +
-        "CLAUDE_TIMEOUT_MS must be an integer between 1000 and 600000; " +
+        "CLAUDE_TIMEOUT_MS must be an integer between 1000 and 1200000; " +
         "CLAUDE_DEFAULT_MODEL must be a model alias or ID; " +
         "CLAUDE_DEFAULT_EFFORT must be low, medium, high, xhigh, or max.",
     );

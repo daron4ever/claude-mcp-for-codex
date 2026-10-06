@@ -391,11 +391,27 @@ Normal consultation calls with no model/effort arguments use Opus 5.5 and medium
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CLAUDE_BIN` | `claude` | Executable name or path, without extra arguments. |
-| `CLAUDE_TIMEOUT_MS` | `120000` | Request timeout; integer from 1,000 to 600,000 milliseconds. |
+| `CLAUDE_TIMEOUT_MS` | `120000` | Request timeout; integer from 1,000 to 1,200,000 milliseconds (20 minutes). |
 | `CLAUDE_DEFAULT_MODEL` | Unset | Optional model alias or ID used when the tool omits `model`. |
 | `CLAUDE_DEFAULT_EFFORT` | Unset | Optional `low`, `medium`, `high`, `xhigh`, or `max` used when the tool omits `effort`. |
 
 Set Codex's `tool_timeout_sec` longer than this timeout plus the two-second cleanup allowance. No `.env` file is loaded. For an existing login stored in a nonstandard Claude configuration directory, forward your existing `CLAUDE_CONFIG_DIR` through Codex's `env_vars`; the wrapper does not inspect that directory.
+
+For a twenty-minute deadline, merge these values into your existing Claude MCP
+tables in the chosen user or project configuration; preserve the command, arguments
+and other environment entries:
+
+```toml
+[mcp_servers.claude]
+tool_timeout_sec = 1210
+
+[mcp_servers.claude.env]
+CLAUDE_TIMEOUT_MS = "1200000"
+```
+
+Restart the MCP connection after changing the configuration. The deadline covers
+CLI startup, settings readbacks, inference and process completion. Increasing it
+allows slower calls more time; it does not establish why an earlier call timed out.
 
 ## Process and data boundaries
 
