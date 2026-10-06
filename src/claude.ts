@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { TextDecoder } from "node:util";
 import { z } from "zod";
 import { modelSchema, effortSchema, type Config } from "./config.js";
+import { NativeProtocol, NativeProtocolError, type ClaudeResult, type ProtocolPhase } from "./native-protocol.js";
+export { outputSchema, type ClaudeResult } from "./native-protocol.js";
 
 export const inputSchema = z.object({
   prompt: z
@@ -22,32 +24,12 @@ export const inputSchema = z.object({
 
 export type ClaudeInput = z.infer<typeof inputSchema>;
 
-const reportedModelIdSchema = modelSchema
-  .regex(/^claude-[a-zA-Z0-9][a-zA-Z0-9._:-]*$/)
-  .refine((id) => id.trim() === id);
-
-export const outputSchema = z.object({
-  answer: z.string().min(1),
-  metadata: z.object({
-    requestedModel: modelSchema.nullable()
-      .describe("Model passed to the CLI after argument/default precedence; null means CLI default."),
-    requestedEffort: effortSchema.nullable()
-      .describe("Effort passed to the CLI; this does not verify effective effort."),
-    cliReportedModelIds: z.array(reportedModelIdSchema).max(16)
-      .describe("CLI modelUsage keys, which may include auxiliary models; not independent attestation."),
-    modelUsageStatus: z.enum(["reported", "unavailable", "invalid"]),
-    effectiveModelVerified: z.literal(false),
-    effectiveEffortVerified: z.literal(false),
-  }),
-});
-
-export type ClaudeResult = z.infer<typeof outputSchema>;
-
 type FailureCategory = "timeout" | "cancelled" | "spawn" | "stdin" | "stdout" |
-  "stderr" | "stdout_limit" | "stderr_limit" | "cli_exit" | "invalid_result" | "cleanup";
+  "stderr" | "stdout_limit" | "stderr_limit" | "cli_exit" | "invalid_result" | "protocol" | "cleanup";
 
 export type ClaudeFailureDiagnostics = {
   failureCategory: FailureCategory;
+  phase: ProtocolPhase;
   elapsedMs: number;
   timeoutMs: number;
   firstStdoutMs: number | null;
@@ -66,20 +48,6 @@ export class ClaudeExecutionError extends Error {
     this.name = "ClaudeExecutionError";
   }
 }
-
-const resultSchema = z.object({
-  type: z.literal("result"),
-  subtype: z.literal("success"),
-  is_error: z.literal(false),
-  result: z.string().min(1),
-  modelUsage: z.unknown().optional(),
-});
-
-// Return only bounded model identifiers, never usage values or other CLI fields.
-const modelUsageSchema = z.record(
-  reportedModelIdSchema,
-  z.object({}),
-).refine((usage) => Object.keys(usage).length <= 16);
 
 const MAX_STDOUT_BYTES = 1_048_576;
 const MAX_STDERR_BYTES = 65_536;
@@ -127,7 +95,7 @@ function invokeClaude(
     const child = spawn(
       config.binary,
       [
-        "--print", "--output-format", "json",
+        "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         ...(model === undefined ? [] : ["--model", model]),
         ...(effort === undefined ? [] : ["--effort", effort]),
         "--safe-mode", "--tools", "", "--disallowedTools", "*",
@@ -151,15 +119,22 @@ function invokeClaude(
     let exitSignal: NodeJS.Signals | null = null;
     let failureSnapshot: Omit<ClaudeFailureDiagnostics, "cleanupStatus"> | undefined;
     let cleanupUnconfirmed = false;
-    const stdout: Buffer[] = [];
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let pendingLine = "";
     let graceTimer: NodeJS.Timeout | undefined;
     let cleanupTimer: NodeJS.Timeout | undefined;
+    const protocol = new NativeProtocol(input.prompt, model, effort, (frame) => {
+      if (!failure && !settled) child.stdin.write(JSON.stringify(frame) + "\n", "utf8");
+    }, () => {
+      if (!failure && !settled) child.stdin.end();
+    });
 
     // Freeze the initial boundary before cleanup changes process state.
     const recordFailure = (failureCategory: FailureCategory): void => {
       if (failureSnapshot !== undefined) return;
       failureSnapshot = {
         failureCategory,
+        phase: protocol.phase,
         elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
         timeoutMs: config.timeoutMs,
         firstStdoutMs,
@@ -204,7 +179,8 @@ function invokeClaude(
       if (failure || settled) return;
       recordFailure(category);
       failure = new Error(message);
-      stdout.length = 0;
+      pendingLine = "";
+      protocol.discard();
       kill("SIGTERM");
       graceTimer = setTimeout(() => {
         kill("SIGKILL");
@@ -249,7 +225,21 @@ function invokeClaude(
       stdoutBytes += chunk.length;
       if (stdoutBytes > MAX_STDOUT_BYTES) {
         stop("Claude response exceeded the 1 MiB limit.", "stdout_limit");
-      } else stdout.push(chunk);
+        return;
+      }
+      try {
+        pendingLine += decoder.decode(chunk, { stream: true });
+        let newline: number;
+        while (!failure && (newline = pendingLine.indexOf("\n")) >= 0) {
+          const line = pendingLine.slice(0, newline);
+          pendingLine = pendingLine.slice(newline + 1);
+          if (line.trim().length > 0) protocol.receive(JSON.parse(line));
+        }
+      } catch (error) {
+        stop(error instanceof NativeProtocolError ? error.message :
+          "Claude Code returned an invalid or unsuccessful JSON result.",
+        error instanceof NativeProtocolError ? error.category : "invalid_result");
+      }
     });
     child.stderr.on("data", (chunk: Buffer) => {
       if (failure) return;
@@ -274,28 +264,17 @@ function invokeClaude(
       }
       let result: ClaudeResult;
       try {
-        const json: unknown = JSON.parse(
-          new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(stdout)),
-        );
-        const parsed = resultSchema.parse(json);
-        const usage = modelUsageSchema.safeParse(parsed.modelUsage);
-        const modelIds = usage.success ? Object.keys(usage.data) : [];
-        let modelUsageStatus: ClaudeResult["metadata"]["modelUsageStatus"] = "unavailable";
-        if (parsed.modelUsage !== undefined && !usage.success) modelUsageStatus = "invalid";
-        else if (modelIds.length > 0) modelUsageStatus = "reported";
-        result = {
-          answer: parsed.result,
-          metadata: {
-            requestedModel: model ?? null,
-            requestedEffort: effort ?? null,
-            cliReportedModelIds: modelIds,
-            modelUsageStatus,
-            effectiveModelVerified: false,
-            effectiveEffortVerified: false,
-          },
-        };
-      } catch {
-        stop("Claude Code returned an invalid or unsuccessful JSON result.", "invalid_result");
+        // Validate final decoder/line state at normal close. EOF can precede
+        // child reaping; it must not start cleanup against an exiting child.
+        pendingLine += decoder.decode();
+        if (pendingLine.trim().length > 0) {
+          throw new NativeProtocolError("Claude Code returned an incomplete stream frame.", "invalid_result");
+        }
+        result = protocol.complete();
+      } catch (error) {
+        stop(error instanceof NativeProtocolError ? error.message :
+          "Claude Code returned an invalid or unsuccessful JSON result.",
+        error instanceof NativeProtocolError ? error.category : "invalid_result");
         return;
       }
       // Consultation mode should not leave background processes. Clear any
@@ -306,7 +285,7 @@ function invokeClaude(
 
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) onAbort();
-    if (!failure) child.stdin.end(input.prompt, "utf8");
+    if (!failure) protocol.start();
   });
 }
 

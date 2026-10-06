@@ -1,12 +1,15 @@
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-export async function fixture(t) {
+export async function fixture(t, options = {}) {
   await mkdir(".cache", { recursive: true });
   const directory = await mkdtemp(resolve(".cache/test-"));
   const binary = resolve(directory, "fake-claude");
-  await copyFile("test/fixtures/fake-claude.mjs", binary);
+  const configuration = typeof options === "function" ? options(directory) : options;
+  const source = await readFile("test/fixtures/fake-claude.mjs", "utf8");
+  await writeFile(binary, source.replace("const fixtureOptions = {};",
+    "const fixtureOptions = " + JSON.stringify(configuration) + ";"));
   await chmod(binary, 0o700);
   t.after(() => rm(directory, { recursive: true, force: true }));
   return { binary, directory };

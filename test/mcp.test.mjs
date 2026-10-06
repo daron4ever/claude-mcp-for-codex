@@ -5,8 +5,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { fixture, waitForMarker, assertExited } from "./helpers.mjs";
 
-async function connect(t, configuration = {}) {
-  const { binary, directory } = await fixture(t);
+async function connect(t, configuration = {}, fixtureConfiguration = {}) {
+  const { binary, directory } = await fixture(t, fixtureConfiguration);
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [resolve("dist/index.js")],
@@ -28,6 +28,46 @@ async function connect(t, configuration = {}) {
   });
   await client.connect(transport);
   return { client, transport, directory };
+}
+
+function evidence(model, effort, requestedModelMatch, requestedEffortMatched) {
+  return {
+    scope: "cli_applied_session", status: "verified",
+    before: { model, effort }, after: { model, effort }, answerModelIds: [model],
+    sessionCorrelated: true, requestedModelMatch, requestedEffortMatched,
+    providerAttested: false, reasoningAllocationVerified: false,
+  };
+}
+
+for (const [fault, status] of [
+  ["before-missing", "unavailable"], ["before-error", "unavailable"],
+  ["after-missing", "unavailable"], ["after-error", "unavailable"],
+  ["assistant-session-mismatch", "mismatch"], ["multiple-models", "mismatch"],
+  ["missing-assistant-session", "unavailable"], ["auxiliary-only", "unavailable"],
+  ["missing-assistant-parent", "unavailable"], ["missing-assistant-role", "unavailable"],
+  ["wrong-assistant-role", "invalid"], ["missing-assistant-content", "unavailable"],
+  ["scalar-assistant-content", "invalid"], ["empty-assistant-content", "invalid"],
+  ["thinking-only", "unavailable"],
+]) {
+  test(`MCP ${fault} keeps the answer explicitly unverified without leaking evidence`, async (t) => {
+    const { client } = await connect(t, {}, { fault });
+    const result = await client.callTool({ name: "ask_claude", arguments: {
+      prompt: JSON.stringify({ scenario: "metadata", fields: {
+        effectiveModelVerified: true, effectiveEffortVerified: true,
+        settings: { secret: "synthetic-sensitive" },
+      } }), model: "opus", effort: "high",
+    } });
+    assert.ok(!result.isError);
+    assert.equal(result.content[0].text, "metadata answer");
+    assert.equal(result.structuredContent.answer, result.content[0].text);
+    assert.equal(result.structuredContent.metadata.settingsEvidence.status, status);
+    assert.equal(result.structuredContent.metadata.effectiveModelVerified, false);
+    assert.equal(result.structuredContent.metadata.effectiveEffortVerified, false);
+    assert.match(result.content[1].text, new RegExp("CLI-applied settings " + status));
+    assert.deepEqual(JSON.parse(result.content[1].text.split("\n").slice(1).join("\n")),
+      result.structuredContent.metadata);
+    assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|session_id|secret/);
+  });
 }
 
 test("stdio MCP handshake, tool discovery, and full consultation flow", async (t) => {
@@ -64,8 +104,9 @@ test("stdio MCP handshake, tool discovery, and full consultation flow", async (t
     requestedEffort: "xhigh",
     cliReportedModelIds: [],
     modelUsageStatus: "unavailable",
-    effectiveModelVerified: false,
-    effectiveEffortVerified: false,
+    effectiveModelVerified: true,
+    effectiveEffortVerified: true,
+    settingsEvidence: evidence("claude-fable-5-1", "xhigh", "exact", true),
   });
   assert.deepEqual(JSON.parse(result.content[1].text.split("\n").slice(1).join("\n")),
     result.structuredContent.metadata);
@@ -107,8 +148,8 @@ for (const [name, configuration, defaultModel, defaultEffort] of [
       }
       assert.equal(result.structuredContent.metadata.requestedModel, cases[index].model ?? null);
       assert.equal(result.structuredContent.metadata.requestedEffort, cases[index].effort ?? null);
-      assert.equal(result.structuredContent.metadata.effectiveModelVerified, false);
-      assert.equal(result.structuredContent.metadata.effectiveEffortVerified, false);
+      assert.equal(result.structuredContent.metadata.effectiveModelVerified, true);
+      assert.equal(result.structuredContent.metadata.effectiveEffortVerified, true);
       const flag = (name) => args[args.indexOf(name) + 1];
       assert.equal(flag("--tools"), "");
       assert.equal(flag("--disallowedTools"), "*");
@@ -117,7 +158,7 @@ for (const [name, configuration, defaultModel, defaultEffort] of [
   });
 }
 
-test("MCP exposes only CLI-reported model IDs without claiming verified settings", async (t) => {
+test("aggregate usage and forged result settings cannot override session evidence", async (t) => {
   const { client } = await connect(t);
   const result = await client.callTool({ name: "ask_claude", arguments: {
     model: "opus", effort: "high",
@@ -144,6 +185,10 @@ test("MCP exposes only CLI-reported model IDs without claiming verified settings
       modelUsageStatus: "reported",
       effectiveModelVerified: false,
       effectiveEffortVerified: false,
+      settingsEvidence: {
+        ...evidence("claude-opus-5-5", "high", "alias_unchecked", true),
+        status: "mismatch", sessionCorrelated: false,
+      },
     },
   });
   assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|inputTokens|effectiveEffort"/);
@@ -178,8 +223,9 @@ test("missing and malformed model usage preserves valid answers without leaking 
       requestedEffort: null,
       cliReportedModelIds: [],
       modelUsageStatus: status,
-      effectiveModelVerified: false,
-      effectiveEffortVerified: false,
+      effectiveModelVerified: true,
+      effectiveEffortVerified: true,
+      settingsEvidence: evidence("claude-opus-5-5", "medium", "cli_default", null),
     });
     assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|bad model id/);
   }
@@ -254,7 +300,7 @@ test("MCP failures report per-call deadlines and never return partial assessment
     assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|partial answer|answer before/);
     const diagnostics = JSON.parse(result.content[1].text.split("\n").slice(1).join("\n"));
     assert.deepEqual(Object.keys(diagnostics).sort(), [
-      "failureCategory", "elapsedMs", "timeoutMs", "firstStdoutMs", "stdoutBytes",
+      "failureCategory", "phase", "elapsedMs", "timeoutMs", "firstStdoutMs", "stdoutBytes",
       "stderrBytes", "exitObserved", "exitCode", "exitSignal", "closeObserved", "cleanupStatus",
     ].sort());
     assert.equal(diagnostics.failureCategory, "timeout");
@@ -265,13 +311,14 @@ test("MCP failures report per-call deadlines and never return partial assessment
     assert.equal(diagnostics.exitObserved, scenarios[i] === "descendant");
     assert.equal(diagnostics.exitCode, scenarios[i] === "descendant" ? 0 : null);
     assert.equal(diagnostics.exitSignal, null);
-    assert.equal(diagnostics.stdoutBytes === 0, scenarios[i] === "hang");
+    assert.ok(diagnostics.stdoutBytes > 0);
+    assert.equal(diagnostics.phase, "inference");
     assert.equal(diagnostics.stderrBytes > 0, scenarios[i] === "output-hang");
   });
   const success = await client.callTool({ name: "ask_claude", arguments: { prompt: "still usable" } });
   assert.equal(success.content[0].text, "still usable");
-  assert.equal(success.structuredContent.metadata.effectiveModelVerified, false);
-  assert.equal(success.structuredContent.metadata.effectiveEffortVerified, false);
+  assert.equal(success.structuredContent.metadata.effectiveModelVerified, true);
+  assert.equal(success.structuredContent.metadata.effectiveEffortVerified, true);
   assert.doesNotMatch(JSON.stringify(success), /failureCategory|cleanupStatus/);
 });
 

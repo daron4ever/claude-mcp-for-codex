@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 import { ClaudeExecutionError, ClaudeRunner, inputSchema } from "../dist/claude.js";
 import { readConfig } from "../dist/config.js";
 import { fixture, waitForMarker, assertExited } from "./helpers.mjs";
@@ -80,6 +81,13 @@ test("launches consultation mode with customizations, tools, MCP and persistence
   assert.deepEqual(JSON.parse(flag("--mcp-config")), { mcpServers: {} });
   assert.deepEqual(JSON.parse(flag("--settings")), { disableAllHooks: true });
   assert.equal(inspected.skipHistory, "1");
+  assert.equal(flag("--input-format"), "stream-json");
+  assert.equal(flag("--output-format"), "stream-json");
+  assert.ok(args.includes("--verbose"));
+  assert.deepEqual(inspected.initializePayload, { subtype: "initialize", hooks: {}, sdkMcpServers: [] });
+  assert.equal(inspected.initialized, 1);
+  assert.equal(inspected.userMessages, 1);
+  assert.equal(inspected.settingsReads, 1);
 });
 
 test("concurrent effort selections stay per call and omission delegates to Claude", async (t) => {
@@ -185,10 +193,11 @@ for (const scenario of ["hang", "ignore-term", "output-hang"]) {
         assert.ok(diagnostics.firstStdoutMs >= 0);
         assert.ok(diagnostics.firstStdoutMs <= diagnostics.elapsedMs);
       } else {
-        assert.equal(diagnostics.stdoutBytes, 0);
+        assert.ok(diagnostics.stdoutBytes > 0);
         assert.equal(diagnostics.stderrBytes, 0);
-        assert.equal(diagnostics.firstStdoutMs, null);
+        assert.ok(diagnostics.firstStdoutMs >= 0);
       }
+      assert.equal(diagnostics.phase, "inference");
       assert.doesNotMatch(JSON.stringify(diagnostics), /synthetic-sensitive|partial answer/);
       return true;
     });
@@ -212,6 +221,110 @@ test("cancellation terminates an active request and leaves other calls usable", 
   assertExited(assert, pid);
   assert.equal((await runner.run({ prompt: "another request" }, signal())).answer, "another request");
 });
+
+test("verified CLI-applied settings bracket one prompt and precede EOF", async (t) => {
+  const { binary, directory } = await fixture(t);
+  const trace = resolve(directory, "trace");
+  const result = await makeRunner(t, binary).run({
+    prompt: JSON.stringify({ scenario: "inspect", trace }), model: "opus", effort: "high",
+  }, signal());
+  assert.equal(result.metadata.effectiveModelVerified, true);
+  assert.equal(result.metadata.effectiveEffortVerified, true);
+  assert.deepEqual(result.metadata.settingsEvidence, {
+    scope: "cli_applied_session", status: "verified",
+    before: { model: "claude-opus-5-5", effort: "high" },
+    after: { model: "claude-opus-5-5", effort: "high" },
+    answerModelIds: ["claude-opus-5-5"], sessionCorrelated: true,
+    requestedModelMatch: "alias_unchecked", requestedEffortMatched: true,
+    providerAttested: false, reasoningAllocationVerified: false,
+  });
+  assert.deepEqual(JSON.parse(await readFile(trace, "utf8")), {
+    initialized: 1, settingsReads: 2, userMessages: 1,
+    initializePayload: { subtype: "initialize", hooks: {}, sdkMcpServers: [] },
+  });
+  assert.doesNotMatch(JSON.stringify(result.metadata), /synthetic-sensitive|session_id|settings"/);
+});
+
+test("incremental UTF-8 and CRLF frames preserve the exact answer", async (t) => {
+  const { binary } = await fixture(t, { chunked: true });
+  const prompt = JSON.stringify({ text: "한국어 🌱\nsecond line", chunked: true });
+  const result = await makeRunner(t, binary).run({ prompt }, signal());
+  assert.equal(result.answer, prompt);
+  assert.equal(result.metadata.settingsEvidence.status, "verified");
+});
+
+for (const fault of ["wrong-id", "duplicate-control", "initialize-error", "result-before-prompt",
+  "duplicate-init", "duplicate-result", "late-assistant", "after-exit"]) {
+  test(`native protocol ${fault} fails safely and preserves subsequent calls`, async (t) => {
+    const { binary } = await fixture(t, { fault });
+    await assert.rejects(makeRunner(t, binary).run({ prompt: "synthetic-sensitive answer" }, signal()),
+      error => {
+        assert.ok(error instanceof ClaudeExecutionError);
+        assert.equal(error.diagnostics.failureCategory, "protocol");
+        assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+        assert.doesNotMatch(error.message + JSON.stringify(error.diagnostics), /synthetic-sensitive/);
+        return true;
+      });
+    const { binary: usable } = await fixture(t);
+    assert.equal((await makeRunner(t, usable).run({ prompt: "usable" }, signal())).answer, "usable");
+  });
+}
+
+for (const [request, options, category, phase] of [
+  [{ scenario: "tool-request" }, {}, "protocol", "inference"],
+  [{ scenario: "tool-use" }, {}, "protocol", "inference"],
+  [{ fault: "result-then-invalid" }, {}, "invalid_result", "settings_after"],
+  [{ fault: "truncated-utf8" }, {}, "invalid_result", "closing"],
+  [{ fault: "unterminated-line" }, {}, "invalid_result", "closing"],
+  [{ scenario: "large-answer" }, {}, "stdout_limit", "inference"],
+  [{}, { fault: "before-overflow" }, "stdout_limit", "settings_before"],
+  [{ fault: "after-overflow" }, {}, "stdout_limit", "settings_after"],
+]) {
+  test(`rejects ${request.scenario ?? request.fault ?? options.fault} without releasing an answer`, async (t) => {
+    const { binary } = await fixture(t, options);
+    await assert.rejects(makeRunner(t, binary).run({ prompt: JSON.stringify(request) }, signal()),
+      error => {
+        assert.ok(error instanceof ClaudeExecutionError);
+        assert.equal(error.diagnostics.failureCategory, category);
+        assert.equal(error.diagnostics.phase, phase);
+        assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+        assert.doesNotMatch(error.message + JSON.stringify(error.diagnostics), /synthetic-sensitive|xxxx/);
+        return true;
+      });
+  });
+}
+
+for (const [fault, phase] of [
+  ["initialize-hang", "initialize"], ["before-hang", "settings_before"],
+  ["after-hang", "settings_after"], ["closing-hang", "closing"],
+]) {
+  for (const operation of ["timeout", "cancel"]) {
+    test(`${operation} during ${phase} discards answers and cleans its process`, async (t) => {
+      const { binary, directory } = await fixture(t, directory => ({
+        fault, marker: resolve(directory, "ready"),
+      }));
+      const controller = new AbortController();
+      const runner = makeRunner(t, binary, operation === "timeout" ? 1000 : 5000);
+      const rejected = assert.rejects(runner.run({ prompt: "synthetic-sensitive answer" },
+        controller.signal), error => {
+        assert.ok(error instanceof ClaudeExecutionError);
+        assert.equal(error.diagnostics.failureCategory, operation === "timeout" ? "timeout" : "cancelled");
+        assert.equal(error.diagnostics.phase, phase);
+        assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+        assert.doesNotMatch(JSON.stringify(error.diagnostics), /synthetic-sensitive|session_id/);
+        if (phase === "initialize") {
+          assert.equal(error.diagnostics.stdoutBytes, 0);
+          assert.equal(error.diagnostics.firstStdoutMs, null);
+        } else assert.ok(error.diagnostics.stdoutBytes > 0);
+        return true;
+      });
+      const pid = await waitForMarker(resolve(directory, "ready"));
+      if (operation === "cancel") controller.abort();
+      await rejected;
+      assertExited(assert, pid);
+    });
+  }
+}
 
 test("a descendant holding stdout cannot keep a timed-out request alive", async (t) => {
   const { binary, directory } = await fixture(t);
