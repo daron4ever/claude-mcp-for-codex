@@ -43,6 +43,7 @@ export const outputSchema = z.object({
 export type ClaudeResult = z.infer<typeof outputSchema>;
 export type ProtocolPhase = "initialize" | "settings_before" | "inference" |
   "settings_after" | "closing";
+export type ProtocolActivity = "response" | "retry";
 
 export class NativeProtocolError extends Error {
   constructor(message: string, readonly category: "protocol" | "invalid_result" = "protocol") {
@@ -72,6 +73,13 @@ const assistantMessageSchema = z.object({
     z.object({ type: z.literal("thinking"), thinking: z.string() }),
     z.object({ type: z.literal("redacted_thinking"), data: z.string() }),
   ])).min(1),
+});
+const retrySchema = z.object({
+  attempt: z.number().int().min(1),
+  max_retries: z.number().int().min(0),
+  retry_delay_ms: z.number().int().min(0),
+  error_status: z.number().int().min(100).max(599).nullable(),
+  session_id: sessionSchema,
 });
 
 // Project only applied fields; full settings and error payloads are never retained.
@@ -136,7 +144,7 @@ export class NativeProtocol {
     return undefined;
   }
 
-  receive(value: unknown): void {
+  receive(value: unknown): ProtocolActivity | undefined {
     const parsedFrame = recordSchema.safeParse(value);
     if (!parsedFrame.success || typeof parsedFrame.data.type !== "string") {
       throw new NativeProtocolError("Claude Code returned an invalid stream frame.", "invalid_result");
@@ -219,6 +227,7 @@ export class NativeProtocol {
       const model = assistant.data.model;
       if (this.answerModels.has(model) || this.answerModels.size < 16) this.answerModels.add(model);
       else this.evidenceInvalid = true;
+      if (session !== undefined) return "response";
     } else if (frame.type === "result") {
       if (this.phase !== "inference" || this.result !== undefined) {
         throw new NativeProtocolError("Claude Code returned an out-of-order result.");
@@ -238,6 +247,10 @@ export class NativeProtocol {
       this.resultSession = this.session(frame.session_id);
       this.phase = "settings_after";
       this.control(this.ids.after, { subtype: "get_settings" });
+      if (this.resultSession !== undefined) return "response";
+    } else if (frame.type === "system" && frame.subtype === "api_retry" &&
+      this.phase === "inference" && retrySchema.safeParse(frame).success) {
+      return "retry";
     }
     // Other notifications are ignored, but still consume the cumulative output budget.
   }

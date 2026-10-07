@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { resolve } from "node:path";
 import { readFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { ClaudeExecutionError, ClaudeRunner, inputSchema } from "../dist/claude.js";
 import { readConfig } from "../dist/config.js";
 import { fixture, waitForMarker, assertExited } from "./helpers.mjs";
@@ -285,7 +286,9 @@ for (const [request, options, category, phase] of [
 ]) {
   test(`rejects ${request.scenario ?? request.fault ?? options.fault} without releasing an answer`, async (t) => {
     const { binary } = await fixture(t, options);
-    await assert.rejects(makeRunner(t, binary).run({ prompt: JSON.stringify(request) }, signal()),
+    const updates = [];
+    await assert.rejects(makeRunner(t, binary).run({ prompt: JSON.stringify(request) }, signal(),
+      value => { updates.push(value); }),
       error => {
         assert.ok(error instanceof ClaudeExecutionError);
         assert.equal(error.diagnostics.failureCategory, category);
@@ -294,6 +297,9 @@ for (const [request, options, category, phase] of [
         assert.doesNotMatch(error.message + JSON.stringify(error.diagnostics), /synthetic-sensitive|xxxx/);
         return true;
       });
+    const count = updates.length;
+    await delay(1100);
+    assert.equal(updates.length, count);
   });
 }
 
@@ -308,8 +314,9 @@ for (const [fault, phase] of [
       }));
       const controller = new AbortController();
       const runner = makeRunner(t, binary, operation === "timeout" ? 1000 : 5000);
+      const updates = [];
       const rejected = assert.rejects(runner.run({ prompt: "synthetic-sensitive answer" },
-        controller.signal), error => {
+        controller.signal, value => { updates.push(value); }), error => {
         assert.ok(error instanceof ClaudeExecutionError);
         assert.equal(error.diagnostics.failureCategory, operation === "timeout" ? "timeout" : "cancelled");
         assert.equal(error.diagnostics.phase, phase);
@@ -319,12 +326,18 @@ for (const [fault, phase] of [
           assert.equal(error.diagnostics.stdoutBytes, 0);
           assert.equal(error.diagnostics.firstStdoutMs, null);
         } else assert.ok(error.diagnostics.stdoutBytes > 0);
+        assert.equal(error.diagnostics.responseEventCount,
+          phase === "settings_after" || phase === "closing" ? 2 : 0);
+        assert.equal(error.diagnostics.retryEventCount, 0);
         return true;
       });
       const pid = await waitForMarker(resolve(directory, "ready"));
       if (operation === "cancel") controller.abort();
       await rejected;
       assertExited(assert, pid);
+      const count = updates.length;
+      await delay(1100);
+      assert.equal(updates.length, count);
     });
   }
 }

@@ -62,6 +62,47 @@ test("CLI readbacks and main answer establish bounded session evidence, independ
   assert.deepEqual(result.metadata.cliReportedModelIds, ["claude-haiku-4-5"]);
 });
 
+test("activity excludes controls, initialization, auxiliary and malformed response evidence", () => {
+  const c = conversation();
+  assert.equal(c.reply({}), undefined);
+  assert.equal(c.reply({ applied: settings }), undefined);
+  assert.equal(c.protocol.receive({ type: "system", subtype: "init", session_id: sessionId }), undefined);
+  const main = { type: "assistant", parent_tool_use_id: null, session_id: sessionId,
+    message: { role: "assistant", model: settings.model,
+      content: [{ type: "thinking", thinking: "synthetic-sensitive-thinking" }] } };
+  assert.equal(c.protocol.receive({ ...main, parent_tool_use_id: "synthetic-sidechain" }), undefined);
+  assert.equal(c.protocol.receive({ ...main, message: { ...main.message, role: "user" } }), undefined);
+  assert.equal(c.protocol.receive({ ...main, session_id: undefined }), undefined);
+  assert.equal(c.protocol.receive(main), "response");
+  assert.equal(c.protocol.receive({ type: "stream_event", event: {
+    type: "content_block_delta", delta: { text: "synthetic-sensitive" } } }), undefined);
+  assert.equal(c.protocol.receive({ type: "result", subtype: "success", is_error: false,
+    result: "exact answer", session_id: sessionId }), "response");
+  assert.equal(c.reply({ applied: settings }), undefined);
+  assert.equal(c.protocol.complete().answer, "exact answer");
+});
+
+test("only well-formed retry notifications during inference count, without changing evidence", () => {
+  const c = conversation();
+  const retry = { type: "system", subtype: "api_retry", attempt: 3, max_retries: 1,
+    retry_delay_ms: 100, error_status: null, session_id: sessionId,
+    error: "synthetic-sensitive-error", no_response: { secret: "synthetic-sensitive" } };
+  assert.equal(c.protocol.receive(retry), undefined);
+  c.reply({}); c.reply({ applied: settings });
+  for (const field of ["attempt", "max_retries", "retry_delay_ms", "error_status", "session_id"]) {
+    for (const value of [undefined, -1, 1.5, field === "session_id" ? "" : "synthetic-sensitive"]) {
+      assert.equal(c.protocol.receive({ ...retry, [field]: value }), undefined);
+    }
+  }
+  assert.equal(c.protocol.receive(retry), "retry");
+  assert.equal(c.protocol.receive({ ...retry, error_status: 529 }), "retry");
+  answer(c);
+  assert.equal(c.protocol.receive(retry), undefined);
+  c.reply({ applied: settings });
+  assert.equal(c.protocol.receive(retry), undefined);
+  assert.equal(c.protocol.complete().metadata.settingsEvidence.status, "verified");
+});
+
 for (const [name, options, status] of [
   ["before unavailable", { before: {} }, "unavailable"],
   ["after unavailable", { after: {} }, "unavailable"],

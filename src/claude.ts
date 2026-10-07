@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { TextDecoder } from "node:util";
 import { z } from "zod";
 import { modelSchema, effortSchema, type Config } from "./config.js";
-import { NativeProtocol, NativeProtocolError, type ClaudeResult, type ProtocolPhase } from "./native-protocol.js";
+import { NativeProtocol, NativeProtocolError, type ClaudeResult } from "./native-protocol.js";
+import { ProgressReporter, type ClaudeProgress, type ProgressObserver } from "./progress.js";
 export { outputSchema, type ClaudeResult } from "./native-protocol.js";
 
 export const inputSchema = z.object({
@@ -27,10 +28,8 @@ export type ClaudeInput = z.infer<typeof inputSchema>;
 type FailureCategory = "timeout" | "cancelled" | "spawn" | "stdin" | "stdout" |
   "stderr" | "stdout_limit" | "stderr_limit" | "cli_exit" | "invalid_result" | "protocol" | "cleanup";
 
-export type ClaudeFailureDiagnostics = {
+export type ClaudeFailureDiagnostics = ClaudeProgress & {
   failureCategory: FailureCategory;
-  phase: ProtocolPhase;
-  elapsedMs: number;
   timeoutMs: number;
   firstStdoutMs: number | null;
   stdoutBytes: number;
@@ -85,6 +84,7 @@ function invokeClaude(
   config: Config,
   input: ClaudeInput,
   signal: AbortSignal,
+  observer?: ProgressObserver,
 ): Promise<ClaudeResult> {
   if (signal.aborted) return Promise.reject(new Error("Claude request cancelled."));
   const model = input.model ?? config.defaultModel;
@@ -123,19 +123,52 @@ function invokeClaude(
     let pendingLine = "";
     let graceTimer: NodeJS.Timeout | undefined;
     let cleanupTimer: NodeJS.Timeout | undefined;
+    let responseEventCount = 0;
+    let lastResponseAt: number | undefined;
+    let retryEventCount = 0;
+    // Re-sample at delivery so throttling never reports an old event age.
+    const reporter = observer === undefined ? undefined :
+      new ProgressReporter(() => observer(progress()));
     const protocol = new NativeProtocol(input.prompt, model, effort, (frame) => {
       if (!failure && !settled) child.stdin.write(JSON.stringify(frame) + "\n", "utf8");
     }, () => {
       if (!failure && !settled) child.stdin.end();
     });
 
+    const progress = (): ClaudeProgress => {
+      const now = performance.now();
+      return {
+        phase: protocol.phase,
+        elapsedMs: Math.max(0, Math.round(now - startedAt)),
+        responseEventCount,
+        lastResponseEventAgeMs: lastResponseAt === undefined ? null :
+          Math.max(0, Math.round(now - lastResponseAt)),
+        retryEventCount,
+      };
+    };
+    const publish = (): void => reporter?.update(progress());
+    const progressTimer = reporter === undefined ? undefined : setInterval(publish, 10_000);
+    const stopReporting = (): void => {
+      clearInterval(progressTimer);
+      reporter?.stop();
+    };
+
+    const receive = (value: unknown): void => {
+      const previousPhase = protocol.phase;
+      const activity = protocol.receive(value);
+      if (activity === "response") {
+        responseEventCount++;
+        lastResponseAt = performance.now();
+      } else if (activity === "retry") retryEventCount++;
+      if (activity !== undefined || previousPhase !== protocol.phase) publish();
+    };
+
     // Freeze the initial boundary before cleanup changes process state.
     const recordFailure = (failureCategory: FailureCategory): void => {
       if (failureSnapshot !== undefined) return;
       failureSnapshot = {
         failureCategory,
-        phase: protocol.phase,
-        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        ...progress(),
         timeoutMs: config.timeoutMs,
         firstStdoutMs,
         stdoutBytes,
@@ -150,6 +183,7 @@ function invokeClaude(
     const finish = (result?: ClaudeResult): void => {
       if (settled) return;
       settled = true;
+      stopReporting();
       clearTimeout(requestTimer);
       clearTimeout(graceTimer);
       clearTimeout(cleanupTimer);
@@ -178,6 +212,7 @@ function invokeClaude(
     const stop = (message: string, category: FailureCategory): void => {
       if (failure || settled) return;
       recordFailure(category);
+      stopReporting();
       failure = new Error(message);
       pendingLine = "";
       protocol.discard();
@@ -233,7 +268,7 @@ function invokeClaude(
         while (!failure && (newline = pendingLine.indexOf("\n")) >= 0) {
           const line = pendingLine.slice(0, newline);
           pendingLine = pendingLine.slice(newline + 1);
-          if (line.trim().length > 0) protocol.receive(JSON.parse(line));
+          if (line.trim().length > 0) receive(JSON.parse(line));
         }
       } catch (error) {
         stop(error instanceof NativeProtocolError ? error.message :
@@ -285,7 +320,10 @@ function invokeClaude(
 
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) onAbort();
-    if (!failure) protocol.start();
+    if (!failure) {
+      protocol.start();
+      publish();
+    }
   });
 }
 
@@ -295,10 +333,10 @@ export class ClaudeRunner {
 
   constructor(private readonly config: Config) {}
 
-  async run(input: ClaudeInput, signal: AbortSignal): Promise<ClaudeResult> {
+  async run(input: ClaudeInput, signal: AbortSignal, observer?: ProgressObserver): Promise<ClaudeResult> {
     const validated = inputSchema.parse(input);
     const request = invokeClaude(
-      this.config, validated, AbortSignal.any([signal, this.shutdown.signal]),
+      this.config, validated, AbortSignal.any([signal, this.shutdown.signal]), observer,
     );
     this.pending.add(request);
     try {

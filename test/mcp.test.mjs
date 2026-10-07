@@ -3,6 +3,8 @@ import test from "node:test";
 import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ProgressNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { setTimeout as delay } from "node:timers/promises";
 import { fixture, waitForMarker, assertExited } from "./helpers.mjs";
 
 async function connect(t, configuration = {}, fixtureConfiguration = {}) {
@@ -38,6 +40,110 @@ function evidence(model, effort, requestedModelMatch, requestedEffortMatched) {
     providerAttested: false, reasoningAllocationVerified: false,
   };
 }
+
+const progressPattern = /^phase=(initialize|settings_before|inference|settings_after|closing) elapsedMs=\d+ responseEvents=\d+ lastResponseAgeMs=(\d+|none_observed) retryEvents=\d+$/;
+
+test("SDK onprogress receives safe live observations before a verified answer", async t => {
+  const { client } = await connect(t, {}, { afterDelayMs: 1300 });
+  const updates = [];
+  let complete = false;
+  const result = await client.callTool({ name: "ask_claude", arguments: {
+    prompt: JSON.stringify({ scenario: "progress", delayMs: 1300, chunked: true, frames: [
+      { type: "system", subtype: "api_retry", attempt: 1, max_retries: 2,
+        retry_delay_ms: 100, error_status: 529, error: "synthetic-sensitive-error" },
+      { type: "system", subtype: "api_retry", attempt: 2, max_retries: 2,
+        retry_delay_ms: 100, error_status: null, no_response: { secret: "synthetic-sensitive" } },
+      { type: "system", subtype: "api_retry", attempt: "synthetic-sensitive-invalid" },
+      { type: "unknown", text: "synthetic-sensitive-unknown" },
+      { type: "stream_event", event: { delta: { text: "synthetic-sensitive-delta" } } },
+    ] }), model: "opus", effort: "high",
+  } }, undefined, { onprogress: value => {
+    assert.equal(complete, false);
+    updates.push({ ...value, receivedAt: performance.now() });
+  } });
+  complete = true;
+  assert.ok(!result.isError);
+  assert.equal(result.content[0].text, "progress answer");
+  assert.equal(result.structuredContent.metadata.settingsEvidence.status, "verified");
+  assert.ok(updates.length >= 3);
+  for (const [i, update] of updates.entries()) {
+    assert.equal(update.total, undefined);
+    assert.match(update.message, progressPattern);
+    assert.doesNotMatch(update.message, /synthetic-sensitive|stalled|thinking|secret/);
+    if (i > 0) {
+      assert.ok(update.progress > updates[i - 1].progress);
+      assert.ok(update.receivedAt - updates[i - 1].receivedAt >= 950);
+    }
+  }
+  assert.ok(updates.some(value => /phase=inference .*responseEvents=0 .*retryEvents=2$/.test(value.message)));
+  assert.ok(updates.some(value => /phase=settings_after .*responseEvents=2 .*lastResponseAgeMs=\d+ retryEvents=2$/.test(value.message)));
+  const count = updates.length;
+  await delay(1100);
+  assert.equal(updates.length, count);
+});
+
+test("zero and empty-string tokens stay isolated while an absent token sends none", async t => {
+  const { client } = await connect(t, { CLAUDE_TIMEOUT_MS: "1200000" });
+  const notifications = [];
+  client.setNotificationHandler(ProgressNotificationSchema,
+    notification => { notifications.push(notification.params); });
+  const results = await Promise.all([0, "", undefined].map(token => client.callTool({
+    name: "ask_claude", arguments: { prompt: JSON.stringify({ scenario: "progress", delayMs: 1200 }) },
+    ...(token === undefined ? {} : { _meta: { progressToken: token } }),
+  }, undefined, { timeout: 10000 })));
+  assert.ok(results.every(result => !result.isError));
+  for (const token of [0, ""]) {
+    const selected = notifications.filter(value => value.progressToken === token);
+    assert.ok(selected.length >= 2);
+    assert.equal(selected[0].progress, 1);
+    assert.ok(selected.every(value => progressPattern.test(value.message)));
+    assert.ok(selected.slice(1).every((value, i) => value.progress > selected[i].progress));
+  }
+  assert.ok(notifications.every(value => value.progressToken === 0 || value.progressToken === ""));
+  const count = notifications.length;
+  await delay(1100);
+  assert.equal(notifications.length, count);
+});
+
+test("silent inference emits a timing tick without changing the absolute timeout", async t => {
+  const { client } = await connect(t, { CLAUDE_TIMEOUT_MS: "10500" });
+  const updates = [];
+  const result = await client.callTool({ name: "ask_claude", arguments: {
+    prompt: JSON.stringify({ scenario: "progress", hang: true }),
+  } }, undefined, { timeout: 15000, onprogress: value => { updates.push(value); } });
+  assert.equal(result.isError, true);
+  const diagnostics = JSON.parse(result.content[1].text.split("\n").slice(1).join("\n"));
+  assert.equal(diagnostics.timeoutMs, 10500);
+  assert.ok(diagnostics.elapsedMs >= 10500 && diagnostics.elapsedMs < 11500);
+  assert.equal(diagnostics.responseEventCount, 0);
+  assert.equal(diagnostics.lastResponseEventAgeMs, null);
+  assert.equal(diagnostics.retryEventCount, 0);
+  assert.ok(updates.some(value => /elapsedMs=10\d{3} responseEvents=0 lastResponseAgeMs=none_observed/.test(value.message)));
+  assert.doesNotMatch(JSON.stringify(updates), /stalled|thinking|synthetic-sensitive/);
+  const count = updates.length;
+  await delay(1100);
+  assert.equal(updates.length, count);
+});
+
+test("MCP cancellation stops notifications and leaves the connection usable", async t => {
+  const { client, directory } = await connect(t);
+  const controller = new AbortController();
+  const updates = [];
+  const marker = resolve(directory, "ready");
+  const request = client.callTool({ name: "ask_claude", arguments: {
+    prompt: JSON.stringify({ scenario: "progress", hang: true, marker }),
+  } }, undefined, { signal: controller.signal, onprogress: value => { updates.push(value); } });
+  const rejected = assert.rejects(request);
+  const pid = await waitForMarker(marker);
+  controller.abort();
+  await rejected;
+  const count = updates.length;
+  await delay(1600);
+  assert.equal(updates.length, count);
+  assertExited(assert, pid);
+  const result = await client.callTool({ name: "ask_claude", arguments: { prompt: "usable" } });
+  assert.equal(result.content[0].text, "usable");
+});
 
 for (const [fault, status] of [
   ["before-missing", "unavailable"], ["before-error", "unavailable"],
@@ -294,7 +400,9 @@ test("MCP failures report per-call deadlines and never return partial assessment
   })));
   results.forEach((result, i) => {
     assert.equal(result.isError, true);
-    assert.equal(result.content[0].text, "Claude request timed out.");
+    assert.equal(result.content[0].text.split("\n")[0], "Claude request timed out.");
+    assert.match(result.content[0].text.split("\n")[1],
+      /^phase=inference elapsedMs=\d+ responseEvents=\d+ lastResponseAgeMs=(\d+|none_observed) retryEvents=0 exit=(yes|no) close=no cleanup=close_observed$/);
     assert.equal(result.structuredContent, undefined);
     assert.equal(result.content.length, 2);
     assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|partial answer|answer before/);
@@ -302,6 +410,7 @@ test("MCP failures report per-call deadlines and never return partial assessment
     assert.deepEqual(Object.keys(diagnostics).sort(), [
       "failureCategory", "phase", "elapsedMs", "timeoutMs", "firstStdoutMs", "stdoutBytes",
       "stderrBytes", "exitObserved", "exitCode", "exitSignal", "closeObserved", "cleanupStatus",
+      "responseEventCount", "lastResponseEventAgeMs", "retryEventCount",
     ].sort());
     assert.equal(diagnostics.failureCategory, "timeout");
     assert.equal(diagnostics.timeoutMs, 1_000);
@@ -314,6 +423,10 @@ test("MCP failures report per-call deadlines and never return partial assessment
     assert.ok(diagnostics.stdoutBytes > 0);
     assert.equal(diagnostics.phase, "inference");
     assert.equal(diagnostics.stderrBytes > 0, scenarios[i] === "output-hang");
+    assert.equal(diagnostics.responseEventCount, scenarios[i] === "hang" ? 0 : 1);
+    assert.equal(diagnostics.retryEventCount, 0);
+    if (scenarios[i] === "hang") assert.equal(diagnostics.lastResponseEventAgeMs, null);
+    else assert.ok(diagnostics.lastResponseEventAgeMs > 0);
   });
   const success = await client.callTool({ name: "ask_claude", arguments: { prompt: "still usable" } });
   assert.equal(success.content[0].text, "still usable");
