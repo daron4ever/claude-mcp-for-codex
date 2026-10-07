@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ClaudeExecutionError, ClaudeRunner, inputSchema, outputSchema } from "./claude.js";
 import type { Config } from "./config.js";
+import { progressMessage } from "./progress.js";
 
 export function createServer(config: Config): {
   server: McpServer;
@@ -34,8 +35,18 @@ export function createServer(config: Config): {
       },
     },
     async (input, extra) => {
+      const token = extra._meta?.progressToken;
+      const hasToken = typeof token === "string" ||
+        typeof token === "number" && Number.isInteger(token);
+      let active = true;
+      let sequence = 0;
       try {
-        const result = await runner.run(input, extra.signal);
+        const result = await runner.run(input, extra.signal, hasToken ? (progress) => {
+          if (!active) return;
+          return extra.sendNotification({ method: "notifications/progress", params: {
+            progressToken: token, progress: ++sequence, message: progressMessage(progress),
+          } });
+        } : undefined);
         return {
           content: [
             { type: "text", text: result.answer },
@@ -46,11 +57,17 @@ export function createServer(config: Config): {
           structuredContent: result,
         };
       } catch (error) {
-        const content: Array<{ type: "text"; text: string }> = [{
+        const message: { type: "text"; text: string } = {
           type: "text",
           text: error instanceof Error ? error.message : "Claude request failed.",
-        }];
+        };
+        const content = [message];
         if (error instanceof ClaudeExecutionError) {
+          const diagnostics = error.diagnostics;
+          message.text += "\n" + progressMessage(diagnostics) +
+            ` exit=${diagnostics.exitObserved ? "yes" : "no"}` +
+            ` close=${diagnostics.closeObserved ? "yes" : "no"}` +
+            ` cleanup=${diagnostics.cleanupStatus}`;
           content.push({
             type: "text",
             text: "Claude failure diagnostics (initial state before cleanup):\n" +
@@ -61,6 +78,8 @@ export function createServer(config: Config): {
           isError: true,
           content,
         };
+      } finally {
+        active = false;
       }
     },
   );

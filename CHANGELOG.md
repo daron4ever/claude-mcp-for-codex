@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Emit bounded content-free progress for supporting MCP clients and add observed response/retry timing to compact failure diagnostics; preserve deadlines, output capacity, privacy and CLI-applied settings verification. Codex UI display depends on client support.
+
 - Allow an optional Claude request deadline up to 20 minutes, preserving the two-minute default and bounded cancellation/cleanup; document the corresponding MCP client timeout.
 - Read native CLI-applied model/effort before and after each answer, correlate main-answer models and sessions, and scope verification flags explicitly to CLI-applied session evidence; provider attestation and reasoning allocation remain unverified. Preserve valid answers with false flags for unavailable, invalid or mismatched evidence.
 - Require valid root-assistant attribution, role and answer-bearing content before verifying CLI-applied settings; malformed or thinking-only evidence cannot establish verification.

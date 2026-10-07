@@ -328,13 +328,21 @@ evidence or answer text. Extraction accepts at most 16 `claude-...` IDs of up to
 128 characters; auxiliary models may appear here. Usage values, raw session IDs,
 full settings, error payloads and unrelated CLI fields are never returned.
 
-Failures set `isError: true` and keep the short error message in the first text block. Failures after CLI launch add a second text block labeled `Claude failure diagnostics (initial state before cleanup):`, followed by JSON such as:
+Failures set `isError: true`. The first text block starts with the short error
+message, followed after CLI launch by a compact summary of phase, elapsed time,
+observed response/retry events and exit/close/cleanup state. This keeps activity
+information near the beginning when a client collapses or truncates output.
+A second text block remains labeled
+`Claude failure diagnostics (initial state before cleanup):`, followed by JSON such as:
 
 ```json
 {
   "failureCategory": "timeout",
   "phase": "initialize",
   "elapsedMs": 300004,
+  "responseEventCount": 0,
+  "lastResponseEventAgeMs": null,
+  "retryEventCount": 0,
   "timeoutMs": 300000,
   "firstStdoutMs": null,
   "stdoutBytes": 0,
@@ -351,12 +359,50 @@ This is an illustrative timeout, not a runtime measurement. `elapsedMs` uses a m
 
 `phase` records the native lifecycle boundary: `initialize`, `settings_before`,
 `inference`, `settings_after`, or `closing`. It locates the wait; it does not
-establish why the CLI stalled.
+establish why the call did not complete.
+
+`responseEventCount` counts structurally valid main assistant and successful
+result frames observed by the wrapper. Control messages, initialization,
+auxiliary messages and malformed response evidence do not count.
+`lastResponseEventAgeMs` is the monotonic time since the latest such frame at the
+initial failure, or `null` if none was observed. `retryEventCount` counts
+well-formed `system/api_retry` events received during inference, not total API
+attempts. Some retries are silent, and the CLI can buffer output. These fields
+describe local observations; silence never proves Claude or the provider stalled.
 
 `failureCategory` records the first wrapper boundary: `timeout`, `cancelled`, `spawn`, `stdin`, `stdout`, `stderr`, `stdout_limit`, `stderr_limit`, `cli_exit`, `invalid_result`, `protocol` or `cleanup`. `protocol` covers broken control/event
 sequencing, premature close and unsupported operation requests. `cleanupStatus` separately describes the final cleanup observation: `close_observed` means the immediate child closed and no process-group signaling failure was observed; `unconfirmed` means cleanup could not be confirmed. It does not attest to descendants outside the process group. A cleanup failure can replace the first error message while retaining the original category and snapshot.
 
 Failure diagnostics contain no prompts, paths, settings, raw CLI output, partial answers or model/effort verification claims. Error responses do not include successful execution metadata or `structuredContent`. Input validation and cancellation before launch can return only the short message. A client/transport timeout that prevents the server response from arriving cannot carry these diagnostics.
+
+### Live progress
+
+Clients that supply an MCP progress token can receive content-free phase,
+elapsed time, response event count/age and observed retry count while a call runs.
+Notifications are limited to one per second and coalesced to the latest state,
+with a timing update every ten seconds during quiet periods. The increasing
+progress number is a notification sequence, not a completion percentage or
+evidence of provider activity. No token means no notifications. The token is
+echoed only in the required protocol field, never in the progress message.
+
+Reporting stops when the request succeeds, fails, is cancelled or shuts down.
+Notification failures or backpressure do not delay the absolute deadline,
+answer or cleanup. No text/thinking deltas, raw errors, settings or session IDs
+are exposed, and partial-message streaming stays disabled to preserve the
+existing cumulative output budget.
+
+Visible progress requires client support. The inspected
+[upstream Codex handler](https://github.com/openai/codex/blob/0b47040dc9eb08d9c37d51e0824870ce5b27101b/codex-rs/rmcp-client/src/logging_client_handler.rs#L63)
+logs progress without forwarding it to the visible UI; installed Codex behavior
+may differ and is unverified. The compact final failure summary remains useful
+when live notifications are not displayed. No stall detector or automatic retry
+is introduced. The twenty-minute deadline is unchanged.
+
+```text
+Accepted Claude frames -> per-call timing/counts -> supporting MCP client
+Failure                -> frozen snapshot -> summary + diagnostics
+Terminal state         -> stop reporting -> existing cleanup
+```
 
 Codex can follow a review policy in your project `AGENTS.md` or user `~/.codex/AGENTS.md`. For example:
 
@@ -445,7 +491,7 @@ the largest answer that fits can be smaller than with final JSON output. No auto
 
 - **Could not start Claude Code:** install the CLI separately or set `CLAUDE_BIN` to its executable. Shell aliases and `.cmd` wrappers are not supported.
 - **Claude Code failed:** check installation, authentication, model availability, and flag support directly in your terminal. Unsupported flags fail the call; the server never retries with weaker restrictions.
-- **Timed out:** inspect the failure diagnostics' `phase`, actual `timeoutMs`, elapsed time and initial exit/close observations. These identify the wrapper boundary, not its root cause. If changing `CLAUDE_TIMEOUT_MS`, also leave the MCP client's timeout longer than the deadline plus cleanup, then restart the MCP connection to load the change. A client timeout or stale running server requires separate evidence.
+- **Timed out:** inspect the compact activity summary and diagnostics' `phase`, actual `timeoutMs`, elapsed time, observed response/retry events and initial exit/close observations. These identify the wrapper boundary, not its root cause; no observed event does not prove a stall. If changing `CLAUDE_TIMEOUT_MS`, also leave the MCP client's timeout longer than the deadline plus cleanup, then restart the MCP connection to load the change. A client timeout or stale running server requires separate evidence.
 - **Unverified CLI-applied settings:** inspect `settingsEvidence.status` and the
   sanitized snapshots; update Claude Code if native readback is unsupported.
   Follow your verification policy instead of assuming requested settings applied.

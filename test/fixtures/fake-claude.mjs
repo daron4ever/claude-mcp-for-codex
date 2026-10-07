@@ -47,8 +47,8 @@ function assistant(text, fields = {}) {
     message: { role: "assistant", model: request.answerModel ?? applied.model,
       content: [{ type: "text", text }] }, ...fields });
 }
-function answer(text, fields = {}) {
-  if (fault() !== "missing-init") {
+function answer(text, fields = {}, initAlreadySent = false) {
+  if (!initAlreadySent && fault() !== "missing-init") {
     emit({ type: "system", subtype: "init", session_id:
       fault() === "init-session-mismatch" ? "synthetic-other-session" : session });
   }
@@ -84,6 +84,13 @@ function answer(text, fields = {}) {
 }
 function runPrompt() {
   switch (request.scenario) {
+    case "progress":
+      emit({ type: "system", subtype: "init", session_id: session });
+      for (const frame of request.frames ?? []) emit({ session_id: session, ...frame });
+      ready();
+      if (request.hang) hold();
+      else setTimeout(() => answer("progress answer", {}, true), request.delayMs ?? 1_300);
+      break;
     case "output-hang":
       assistant("synthetic-sensitive partial answer");
       process.stderr.write("synthetic-sensitive diagnostics");
@@ -160,7 +167,9 @@ lines.on("line", line => {
     const value = fixtureOptions[position] ?? request[position] ?? applied;
     const payload = { applied: value, settings: { secret: "synthetic-sensitive-settings" } };
     if (fault() === position + "-missing") delete payload.applied;
-    control(frame, payload);
+    if (position === "after" && fixtureOptions.afterDelayMs) {
+      setTimeout(() => control(frame, payload), fixtureOptions.afterDelayMs);
+    } else control(frame, payload);
     if (position === "after" && fault() === "truncated-utf8") process.stdout.write(Buffer.from([0xc3]));
     if (position === "after" && fault() === "unterminated-line") process.stdout.write("{");
     if (fault() === "closing-hang" && position === "after") { ready(); hold(); }
