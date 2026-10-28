@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Update the MCP SDK to 1.32.2, Zod to 4.6.7 and affected transitive dependencies to clear dependency audit findings while preserving the existing CI security gates and stdio behavior.
+
 - Distinguish UTF-8/JSON/frame/result failures and recognized unsuccessful CLI result declarations with safe diagnostic reasons and allowlisted subtypes, preserving fail-closed assessment handling, private error bodies, initial snapshots and existing lifecycle limits.
 
 - Emit bounded content-free progress for supporting MCP clients and add observed response/retry timing to compact failure diagnostics; preserve deadlines, output capacity, privacy and CLI-applied settings verification. Codex UI display depends on client support.
