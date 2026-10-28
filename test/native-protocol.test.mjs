@@ -62,6 +62,67 @@ test("CLI readbacks and main answer establish bounded session evidence, independ
   assert.deepEqual(result.metadata.cliReportedModelIds, ["claude-haiku-4-5"]);
 });
 
+test("recognized unsuccessful result declarations expose only allowlisted classification", () => {
+  for (const subtype of ["error_during_execution", "error_max_turns", "error_max_budget_usd",
+    "error_max_structured_output_retries"]) {
+    const c = conversation(); c.reply({}); c.reply({ applied: settings });
+    assert.throws(() => c.protocol.receive({ type: "result", subtype, is_error: true,
+      errors: ["synthetic-sensitive-cause"], session_id: sessionId,
+      result: "synthetic-sensitive-assessment", settings: { secret: "synthetic-sensitive" } }), error => {
+      assert.equal(error.category, "invalid_result");
+      assert.deepEqual(error.details, { failureReason: "cli_error_result", cliResultSubtype: subtype });
+      assert.match(error.message, new RegExp(subtype));
+      assert.doesNotMatch(JSON.stringify(error) + error.message, /synthetic-sensitive/);
+      return true;
+    });
+    assert.throws(() => c.protocol.complete(), /before completing/);
+    assert.equal(c.eof(), 0);
+    assert.equal(c.sent.filter(frame => frame.type === "control_request").length, 2);
+  }
+});
+
+test("unknown or contradictory result declarations stay invalid without echoing payloads", () => {
+  for (const fields of [
+    { subtype: "synthetic-sensitive-unknown", is_error: true, result: "synthetic-sensitive" },
+    { subtype: "error_during_execution", is_error: false },
+    { subtype: "error_during_execution", is_error: "synthetic-sensitive" },
+    { subtype: "error_during_execution" },
+    { subtype: "success", is_error: true, result: "synthetic-sensitive" },
+    { subtype: "success", is_error: false, result: "" },
+    { subtype: "success", is_error: false },
+    { subtype: "success", is_error: false, result: 7 },
+    { subtype: null, is_error: true },
+  ]) {
+    const c = conversation(); c.reply({}); c.reply({ applied: settings });
+    assert.throws(() => c.protocol.receive({ type: "result", ...fields }), error => {
+      assert.equal(error.category, "invalid_result");
+      assert.deepEqual(error.details, { failureReason: "invalid_result_shape", cliResultSubtype: null });
+      assert.doesNotMatch(JSON.stringify(error) + error.message, /synthetic-sensitive/);
+      return true;
+    });
+  }
+});
+
+test("invalid root frames and out-of-order failed results retain distinct boundaries", () => {
+  for (const value of [null, [], 7, "synthetic-sensitive", {}, {type:3}]) {
+    assert.throws(() => conversation().protocol.receive(value), error => {
+      assert.deepEqual(error.details, { failureReason: "invalid_frame", cliResultSubtype: null });
+      assert.doesNotMatch(error.message, /synthetic-sensitive/);
+      return true;
+    });
+  }
+  const failed = { type: "result", subtype: "error_during_execution", is_error: true };
+  for (const ready of [false, true]) {
+    const c = conversation();
+    if (ready) { c.reply({}); c.reply({ applied: settings }); answer(c); }
+    assert.throws(() => c.protocol.receive(failed), error => {
+      assert.equal(error.category, "protocol");
+      assert.equal(error.details, undefined);
+      return true;
+    });
+  }
+});
+
 test("activity excludes controls, initialization, auxiliary and malformed response evidence", () => {
   const c = conversation();
   assert.equal(c.reply({}), undefined);

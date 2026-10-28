@@ -338,6 +338,8 @@ A second text block remains labeled
 ```json
 {
   "failureCategory": "timeout",
+  "failureReason": null,
+  "cliResultSubtype": null,
   "phase": "initialize",
   "elapsedMs": 300004,
   "responseEventCount": 0,
@@ -372,6 +374,36 @@ describe local observations; silence never proves Claude or the provider stalled
 
 `failureCategory` records the first wrapper boundary: `timeout`, `cancelled`, `spawn`, `stdin`, `stdout`, `stderr`, `stdout_limit`, `stderr_limit`, `cli_exit`, `invalid_result`, `protocol` or `cleanup`. `protocol` covers broken control/event
 sequencing, premature close and unsupported operation requests. `cleanupStatus` separately describes the final cleanup observation: `close_observed` means the immediate child closed and no process-group signaling failure was observed; `unconfirmed` means cleanup could not be confirmed. It does not attest to descendants outside the process group. A cleanup failure can replace the first error message while retaining the original category and snapshot.
+
+For `invalid_result`, `failureReason` distinguishes the rejecting check:
+
+| Reason | Observation |
+| --- | --- |
+| `invalid_utf8` | Stream decoding failed, including a truncated UTF-8 sequence at close. |
+| `invalid_json` | A complete nonblank line could not be parsed as JSON. |
+| `invalid_frame` | Parsed JSON lacked a valid top-level frame shape. |
+| `invalid_result_shape` | A result lacked the required success fields or had an unrecognized/contradictory declaration. |
+| `cli_error_result` | A recognized unsuccessful subtype was received with `is_error: true`. |
+| `incomplete_frame` | Nonblank output remained without its line terminator at normal close. |
+| `unexpected_exception` | Response processing failed outside the recognized protocol checks. |
+
+`cliResultSubtype` is populated only for `cli_error_result`: `error_during_execution`,
+`error_max_turns`, `error_max_budget_usd`, or `error_max_structured_output_retries`.
+It identifies the CLI's declaration, not a verified provider cause or validation
+of every error-envelope field. Unknown strings and raw `errors` bodies are never
+echoed. Both new fields are `null` for other failure categories. The broad
+`invalid_result` category remains unchanged; existing saved generic failures cannot
+be retrospectively classified from byte counts alone. Human-readable error messages
+also distinguish decoding/parsing, invalid envelopes and recognized unsuccessful results.
+
+```text
+Rejected output -> fixed reason + known CLI subtype -> error diagnostics
+                -> discard assessment -> unchanged bounded cleanup
+```
+
+These fields share the frozen initial-failure boundary. A later cleanup error
+does not replace them. Failed calls still return no assessment or successful
+settings-verification metadata, and the request deadline remains unchanged.
 
 Failure diagnostics contain no prompts, paths, settings, raw CLI output, partial answers or model/effort verification claims. Error responses do not include successful execution metadata or `structuredContent`. Input validation and cancellation before launch can return only the short message. A client/transport timeout that prevents the server response from arriving cannot carry these diagnostics.
 
@@ -491,6 +523,7 @@ the largest answer that fits can be smaller than with final JSON output. No auto
 
 - **Could not start Claude Code:** install the CLI separately or set `CLAUDE_BIN` to its executable. Shell aliases and `.cmd` wrappers are not supported.
 - **Claude Code failed:** check installation, authentication, model availability, and flag support directly in your terminal. Unsupported flags fail the call; the server never retries with weaker restrictions.
+- **Invalid or unsuccessful result:** inspect `failureReason` and `cliResultSubtype`. A valid JSON error declaration is distinct from malformed JSON or an invalid success envelope; raw error text stays private. Increasing the timeout does not address an early parse/result rejection. The CLI version and underlying cause still require separate evidence.
 - **Timed out:** inspect the compact activity summary and diagnostics' `phase`, actual `timeoutMs`, elapsed time, observed response/retry events and initial exit/close observations. These identify the wrapper boundary, not its root cause; no observed event does not prove a stall. If changing `CLAUDE_TIMEOUT_MS`, also leave the MCP client's timeout longer than the deadline plus cleanup, then restart the MCP connection to load the change. A client timeout or stale running server requires separate evidence.
 - **Unverified CLI-applied settings:** inspect `settingsEvidence.status` and the
   sanitized snapshots; update Claude Code if native readback is unsupported.

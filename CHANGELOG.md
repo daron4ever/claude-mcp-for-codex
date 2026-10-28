@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Distinguish UTF-8/JSON/frame/result failures and recognized unsuccessful CLI result declarations with safe diagnostic reasons and allowlisted subtypes, preserving fail-closed assessment handling, private error bodies, initial snapshots and existing lifecycle limits.
+
 - Emit bounded content-free progress for supporting MCP clients and add observed response/retry timing to compact failure diagnostics; preserve deadlines, output capacity, privacy and CLI-applied settings verification. Codex UI display depends on client support.
 
 - Allow an optional Claude request deadline up to 20 minutes, preserving the two-minute default and bounded cancellation/cleanup; document the corresponding MCP client timeout.

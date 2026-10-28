@@ -41,6 +41,48 @@ function evidence(model, effort, requestedModelMatch, requestedEffortMatched) {
   };
 }
 
+test("MCP error diagnostics distinguish parse failures from declared CLI failures without leaking bodies", async t => {
+  const { client } = await connect(t);
+  const cases = [
+    { request: {scenario:"invalid"}, reason:"invalid_json", subtype:null },
+    { request: {scenario:"invalid-utf8"}, reason:"invalid_utf8", subtype:null },
+    { request: {scenario:"invalid-frame"}, reason:"invalid_frame", subtype:null },
+    { request: {scenario:"empty"}, reason:"invalid_result_shape", subtype:null },
+    ...["error_during_execution", "error_max_turns", "error_max_budget_usd",
+      "error_max_structured_output_retries"].map(subtype => ({
+      request: {scenario:"result-frame", chunked:true, frame: {
+        type:"result", subtype, is_error:true, errors:["synthetic-sensitive-error"],
+        result:"synthetic-sensitive-partial-answer", session_id:"synthetic-sensitive-session",
+        settings:{token:"synthetic-sensitive-token"},
+      }}, reason:"cli_error_result", subtype,
+    })),
+    { request: {scenario:"result-frame", frame: {type:"result", subtype:"synthetic-sensitive-unknown",
+      is_error:true, result:"synthetic-sensitive-result"}}, reason:"invalid_result_shape", subtype:null },
+    { request: {scenario:"result-frame", frame: {type:"result", subtype:"error_max_turns",
+      is_error:false}}, reason:"invalid_result_shape", subtype:null },
+  ];
+  for (const {request, reason, subtype} of cases) {
+    const result = await client.callTool({ name:"ask_claude", arguments: {
+      prompt:JSON.stringify(request), model:"opus", effort:"xhigh",
+    } });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent, undefined);
+    const diagnostics = JSON.parse(result.content[1].text.split("\n").slice(1).join("\n"));
+    assert.equal(diagnostics.failureCategory, "invalid_result");
+    assert.equal(diagnostics.failureReason, reason);
+    assert.equal(diagnostics.cliResultSubtype, subtype);
+    assert.equal(diagnostics.phase, "inference");
+    assert.equal(diagnostics.cleanupStatus, "close_observed");
+    assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive|effectiveModelVerified|effectiveEffortVerified/);
+    if (subtype) assert.ok(result.content[0].text.startsWith(
+      `Claude Code reported an unsuccessful result (${subtype}).\n`));
+  }
+  const success = await client.callTool({name:"ask_claude",arguments:{prompt:"still usable"}});
+  assert.equal(success.content[0].text, "still usable");
+  assert.equal(success.structuredContent.metadata.settingsEvidence.status, "verified");
+  assert.doesNotMatch(JSON.stringify(success), /failureReason|cliResultSubtype/);
+});
+
 const progressPattern = /^phase=(initialize|settings_before|inference|settings_after|closing) elapsedMs=\d+ responseEvents=\d+ lastResponseAgeMs=(\d+|none_observed) retryEvents=\d+$/;
 
 test("SDK onprogress receives safe live observations before a verified answer", async t => {
@@ -411,8 +453,11 @@ test("MCP failures report per-call deadlines and never return partial assessment
       "failureCategory", "phase", "elapsedMs", "timeoutMs", "firstStdoutMs", "stdoutBytes",
       "stderrBytes", "exitObserved", "exitCode", "exitSignal", "closeObserved", "cleanupStatus",
       "responseEventCount", "lastResponseEventAgeMs", "retryEventCount",
+      "failureReason", "cliResultSubtype",
     ].sort());
     assert.equal(diagnostics.failureCategory, "timeout");
+    assert.equal(diagnostics.failureReason, null);
+    assert.equal(diagnostics.cliResultSubtype, null);
     assert.equal(diagnostics.timeoutMs, 1_000);
     assert.ok(diagnostics.elapsedMs >= 1_000);
     assert.equal(diagnostics.closeObserved, false);

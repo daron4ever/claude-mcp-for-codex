@@ -2,7 +2,10 @@ import { spawn } from "node:child_process";
 import { TextDecoder } from "node:util";
 import { z } from "zod";
 import { modelSchema, effortSchema, type Config } from "./config.js";
-import { NativeProtocol, NativeProtocolError, type ClaudeResult } from "./native-protocol.js";
+import {
+  NativeProtocol, NativeProtocolError, type ClaudeResult, type CliResultSubtype,
+  type InvalidResultReason, type ResultFailureDetails,
+} from "./native-protocol.js";
 import { ProgressReporter, type ClaudeProgress, type ProgressObserver } from "./progress.js";
 export { outputSchema, type ClaudeResult } from "./native-protocol.js";
 
@@ -30,6 +33,8 @@ type FailureCategory = "timeout" | "cancelled" | "spawn" | "stdin" | "stdout" |
 
 export type ClaudeFailureDiagnostics = ClaudeProgress & {
   failureCategory: FailureCategory;
+  failureReason: InvalidResultReason | null;
+  cliResultSubtype: CliResultSubtype | null;
   timeoutMs: number;
   firstStdoutMs: number | null;
   stdoutBytes: number;
@@ -164,10 +169,12 @@ function invokeClaude(
     };
 
     // Freeze the initial boundary before cleanup changes process state.
-    const recordFailure = (failureCategory: FailureCategory): void => {
+    const recordFailure = (failureCategory: FailureCategory, details?: ResultFailureDetails): void => {
       if (failureSnapshot !== undefined) return;
       failureSnapshot = {
         failureCategory,
+        failureReason: details?.failureReason ?? null,
+        cliResultSubtype: details?.cliResultSubtype ?? null,
         ...progress(),
         timeoutMs: config.timeoutMs,
         firstStdoutMs,
@@ -209,9 +216,9 @@ function invokeClaude(
       }
     };
 
-    const stop = (message: string, category: FailureCategory): void => {
+    const stop = (message: string, category: FailureCategory, details?: ResultFailureDetails): void => {
       if (failure || settled) return;
-      recordFailure(category);
+      recordFailure(category, details);
       stopReporting();
       failure = new Error(message);
       pendingLine = "";
@@ -262,18 +269,29 @@ function invokeClaude(
         stop("Claude response exceeded the 1 MiB limit.", "stdout_limit");
         return;
       }
+      let failureReason: InvalidResultReason = "invalid_utf8";
       try {
         pendingLine += decoder.decode(chunk, { stream: true });
         let newline: number;
         while (!failure && (newline = pendingLine.indexOf("\n")) >= 0) {
           const line = pendingLine.slice(0, newline);
           pendingLine = pendingLine.slice(newline + 1);
-          if (line.trim().length > 0) receive(JSON.parse(line));
+          if (line.trim().length > 0) {
+            failureReason = "invalid_json";
+            const frame: unknown = JSON.parse(line);
+            failureReason = "unexpected_exception";
+            receive(frame);
+          }
         }
       } catch (error) {
-        stop(error instanceof NativeProtocolError ? error.message :
-          "Claude Code returned an invalid or unsuccessful JSON result.",
-        error instanceof NativeProtocolError ? error.category : "invalid_result");
+        if (error instanceof NativeProtocolError) {
+          stop(error.message, error.category, error.details);
+        } else {
+          const message = failureReason === "invalid_utf8" ? "Claude Code returned invalid UTF-8 output." :
+            failureReason === "invalid_json" ? "Claude Code returned invalid JSON output." :
+              "Claude Code failed while processing its response.";
+          stop(message, "invalid_result", { failureReason, cliResultSubtype: null });
+        }
       }
     });
     child.stderr.on("data", (chunk: Buffer) => {
@@ -298,18 +316,25 @@ function invokeClaude(
         return;
       }
       let result: ClaudeResult;
+      let failureReason: InvalidResultReason = "invalid_utf8";
       try {
         // Validate final decoder/line state at normal close. EOF can precede
         // child reaping; it must not start cleanup against an exiting child.
         pendingLine += decoder.decode();
+        failureReason = "unexpected_exception";
         if (pendingLine.trim().length > 0) {
-          throw new NativeProtocolError("Claude Code returned an incomplete stream frame.", "invalid_result");
+          throw new NativeProtocolError("Claude Code returned an incomplete stream frame.", "invalid_result",
+            { failureReason: "incomplete_frame", cliResultSubtype: null });
         }
         result = protocol.complete();
       } catch (error) {
-        stop(error instanceof NativeProtocolError ? error.message :
-          "Claude Code returned an invalid or unsuccessful JSON result.",
-        error instanceof NativeProtocolError ? error.category : "invalid_result");
+        if (error instanceof NativeProtocolError) {
+          stop(error.message, error.category, error.details);
+        } else {
+          const message = failureReason === "invalid_utf8" ? "Claude Code returned invalid UTF-8 output." :
+            "Claude Code failed while processing its response.";
+          stop(message, "invalid_result", { failureReason, cliResultSubtype: null });
+        }
         return;
       }
       // Consultation mode should not leave background processes. Clear any
