@@ -383,11 +383,11 @@ For `invalid_result`, `failureReason` distinguishes the rejecting check:
 | `invalid_json` | A complete nonblank line could not be parsed as JSON. |
 | `invalid_frame` | Parsed JSON lacked a valid top-level frame shape. |
 | `invalid_result_shape` | A result lacked the required success fields or had an unrecognized/contradictory declaration. |
-| `cli_error_result` | A recognized unsuccessful subtype was received with `is_error: true`. |
+| `cli_error_result` | A recognized result subtype was received with `is_error: true`, including `success` for an API error. |
 | `incomplete_frame` | Nonblank output remained without its line terminator at normal close. |
 | `unexpected_exception` | Response processing failed outside the recognized protocol checks. |
 
-`cliResultSubtype` is populated only for `cli_error_result`: `error_during_execution`,
+`cliResultSubtype` is populated only for `cli_error_result`: `success`, `error_during_execution`,
 `error_max_turns`, `error_max_budget_usd`, or `error_max_structured_output_retries`.
 It identifies the CLI's declaration, not a verified provider cause or validation
 of every error-envelope field. Unknown strings and raw `errors` bodies are never
@@ -395,6 +395,15 @@ echoed. Both new fields are `null` for other failure categories. The broad
 `invalid_result` category remains unchanged; existing saved generic failures cannot
 be retrospectively classified from byte counts alone. Human-readable error messages
 also distinguish decoding/parsing, invalid envelopes and recognized unsuccessful results.
+
+The CLI can return `subtype: "success"` with `is_error: true` when a turn ends in
+an API error, as documented in the [published SDK contract](https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.312/sdk.d.ts).
+Here `success` is the envelope subtype, not a successful assessment. The bridge
+reports `cli_error_result`, discards the error text and returns no assessment.
+It does not infer authentication, billing, model availability or another provider
+cause from the subtype alone. Valid assessments still require `is_error: false`
+and all existing success checks. Increasing the deadline cannot fix this early
+CLI-declared failure.
 
 ```text
 Rejected output -> fixed reason + known CLI subtype -> error diagnostics

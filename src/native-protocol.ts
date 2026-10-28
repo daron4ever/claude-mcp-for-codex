@@ -46,7 +46,7 @@ export type ProtocolPhase = "initialize" | "settings_before" | "inference" |
 export type ProtocolActivity = "response" | "retry";
 
 const cliResultSubtypeSchema = z.enum([
-  "error_during_execution", "error_max_turns", "error_max_budget_usd",
+  "success", "error_during_execution", "error_max_turns", "error_max_budget_usd",
   "error_max_structured_output_retries",
 ]);
 export type CliResultSubtype = z.infer<typeof cliResultSubtypeSchema>;
@@ -249,8 +249,9 @@ export class NativeProtocol {
       if (this.phase !== "inference" || this.result !== undefined) {
         throw new NativeProtocolError("Claude Code returned an out-of-order result.");
       }
-      // Recognize only the declaration; raw error bodies and unknown subtypes
-      // never enter diagnostics. A declared failure is never an assessment.
+      // The CLI also uses subtype=success with is_error=true for API errors.
+      // Recognize only the declaration; raw bodies and unknown subtypes never
+      // enter diagnostics. A declared failure is never an assessment.
       const declaredError = cliResultSubtypeSchema.safeParse(frame.subtype);
       if (frame.is_error === true && declaredError.success) {
         throw new NativeProtocolError(
