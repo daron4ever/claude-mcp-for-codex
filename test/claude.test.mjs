@@ -187,6 +187,32 @@ test("unexpected receipt exceptions have a safe reason instead of a fabricated p
   });
 });
 
+test("success-subtype API errors fail privately, clean up and permit the next call", async t => {
+  const { binary, directory } = await fixture(t);
+  const runner = makeRunner(t, binary);
+  const marker = resolve(directory, "ready");
+  const request = runner.run({ prompt: JSON.stringify({ scenario: "result-frame", marker,
+    frame: { type: "result", subtype: "success", is_error: true,
+      result: "synthetic-sensitive-api-error", api_error_status: 401,
+      session_id: "synthetic-sensitive-session", settings: { token: "synthetic-sensitive" } },
+  }), model: "opus", effort: "xhigh" }, signal());
+  const rejected = assert.rejects(request, error => {
+    assert.ok(error instanceof ClaudeExecutionError);
+    assert.equal(error.diagnostics.failureCategory, "invalid_result");
+    assert.equal(error.diagnostics.failureReason, "cli_error_result");
+    assert.equal(error.diagnostics.cliResultSubtype, "success");
+    assert.equal(error.diagnostics.phase, "inference");
+    assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+    assert.doesNotMatch(error.message + JSON.stringify(error),
+      /synthetic-sensitive|effectiveModelVerified|effectiveEffortVerified|api_error_status/);
+    return true;
+  });
+  const pid = await waitForMarker(marker);
+  await rejected;
+  assertExited(assert, pid);
+  assert.equal((await runner.run({ prompt: "next call works" }, signal())).answer, "next call works");
+});
+
 test("cleanup errors cannot overwrite the original declared-failure classification", async t => {
   const { binary, directory } = await fixture(t);
   const marker = resolve(directory, "ready");

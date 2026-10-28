@@ -48,7 +48,7 @@ test("MCP error diagnostics distinguish parse failures from declared CLI failure
     { request: {scenario:"invalid-utf8"}, reason:"invalid_utf8", subtype:null },
     { request: {scenario:"invalid-frame"}, reason:"invalid_frame", subtype:null },
     { request: {scenario:"empty"}, reason:"invalid_result_shape", subtype:null },
-    ...["error_during_execution", "error_max_turns", "error_max_budget_usd",
+    ...["success", "error_during_execution", "error_max_turns", "error_max_budget_usd",
       "error_max_structured_output_retries"].map(subtype => ({
       request: {scenario:"result-frame", chunked:true, frame: {
         type:"result", subtype, is_error:true, errors:["synthetic-sensitive-error"],

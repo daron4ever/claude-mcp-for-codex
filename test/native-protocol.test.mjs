@@ -63,7 +63,7 @@ test("CLI readbacks and main answer establish bounded session evidence, independ
 });
 
 test("recognized unsuccessful result declarations expose only allowlisted classification", () => {
-  for (const subtype of ["error_during_execution", "error_max_turns", "error_max_budget_usd",
+  for (const subtype of ["success", "error_during_execution", "error_max_turns", "error_max_budget_usd",
     "error_max_structured_output_retries"]) {
     const c = conversation(); c.reply({}); c.reply({ applied: settings });
     assert.throws(() => c.protocol.receive({ type: "result", subtype, is_error: true,
@@ -87,7 +87,8 @@ test("unknown or contradictory result declarations stay invalid without echoing 
     { subtype: "error_during_execution", is_error: false },
     { subtype: "error_during_execution", is_error: "synthetic-sensitive" },
     { subtype: "error_during_execution" },
-    { subtype: "success", is_error: true, result: "synthetic-sensitive" },
+    { subtype: "success", is_error: "true", result: "synthetic-sensitive" },
+    { subtype: "success", result: "synthetic-sensitive" },
     { subtype: "success", is_error: false, result: "" },
     { subtype: "success", is_error: false },
     { subtype: "success", is_error: false, result: 7 },
@@ -111,15 +112,17 @@ test("invalid root frames and out-of-order failed results retain distinct bounda
       return true;
     });
   }
-  const failed = { type: "result", subtype: "error_during_execution", is_error: true };
-  for (const ready of [false, true]) {
-    const c = conversation();
-    if (ready) { c.reply({}); c.reply({ applied: settings }); answer(c); }
-    assert.throws(() => c.protocol.receive(failed), error => {
-      assert.equal(error.category, "protocol");
-      assert.equal(error.details, undefined);
-      return true;
-    });
+  for (const subtype of ["success", "error_during_execution"]) {
+    const failed = { type: "result", subtype, is_error: true };
+    for (const ready of [false, true]) {
+      const c = conversation();
+      if (ready) { c.reply({}); c.reply({ applied: settings }); answer(c); }
+      assert.throws(() => c.protocol.receive(failed), error => {
+        assert.equal(error.category, "protocol");
+        assert.equal(error.details, undefined);
+        return true;
+      });
+    }
   }
 });
 
