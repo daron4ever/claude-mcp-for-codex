@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { ClaudeExecutionError, ClaudeRunner, inputSchema } from "../dist/claude.js";
+import { NativeProtocol } from "../dist/native-protocol.js";
 import { readConfig } from "../dist/config.js";
 import { fixture, waitForMarker, assertExited } from "./helpers.mjs";
 
@@ -146,7 +147,7 @@ test("missing executable produces a safe actionable failure", async (t) => {
 });
 
 for (const scenario of ["error", "invalid", "invalid-utf8", "envelope-error", "empty",
-  "stdout-overflow", "stderr-overflow"]) {
+  "invalid-frame", "stdout-overflow", "stderr-overflow"]) {
   test(`handles ${scenario} without returning raw diagnostics or partial output`, async (t) => {
     const { binary } = await fixture(t);
     const runner = makeRunner(t, binary);
@@ -158,12 +159,64 @@ for (const scenario of ["error", "invalid", "invalid-utf8", "envelope-error", "e
       assert.equal(error.diagnostics.failureCategory,
         scenario === "error" ? "cli_exit" : scenario === "stdout-overflow" ? "stdout_limit" :
           scenario === "stderr-overflow" ? "stderr_limit" : "invalid_result");
+      assert.equal(error.diagnostics.failureReason, {
+        invalid: "invalid_json", "invalid-utf8": "invalid_utf8", "envelope-error": "cli_error_result",
+        empty: "invalid_result_shape", "invalid-frame": "invalid_frame",
+      }[scenario] ?? null);
+      assert.equal(error.diagnostics.cliResultSubtype,
+        scenario === "envelope-error" ? "error_during_execution" : null);
       return true;
     });
     assert.equal((await runner.run({ prompt: "subsequent request works" }, signal())).answer,
       "subsequent request works");
   });
 }
+
+test("unexpected receipt exceptions have a safe reason instead of a fabricated parse error", async t => {
+  const { binary } = await fixture(t);
+  t.mock.method(NativeProtocol.prototype, "receive", () => {
+    throw new Error("synthetic-sensitive-internal-error");
+  });
+  await assert.rejects(makeRunner(t, binary).run({ prompt: "synthetic-sensitive" }, signal()), error => {
+    assert.equal(error.diagnostics.failureCategory, "invalid_result");
+    assert.equal(error.diagnostics.failureReason, "unexpected_exception");
+    assert.equal(error.diagnostics.cliResultSubtype, null);
+    assert.doesNotMatch(error.message + JSON.stringify(error.diagnostics), /synthetic-sensitive/);
+    assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+    return true;
+  });
+});
+
+test("cleanup errors cannot overwrite the original declared-failure classification", async t => {
+  const { binary, directory } = await fixture(t);
+  const marker = resolve(directory, "ready");
+  const originalKill = process.kill;
+  t.mock.method(process, "kill", function (target, signalName) {
+    if (target < 0 && signalName === "SIGTERM") {
+      throw Object.assign(new Error("synthetic-sensitive-cleanup"), { code: "EPERM" });
+    }
+    return originalKill.call(process, target, signalName);
+  });
+  const request = makeRunner(t, binary).run({ prompt: JSON.stringify({ scenario: "result-frame", marker,
+    frame: { type: "result", subtype: "error_max_turns", is_error: true,
+      errors: ["synthetic-sensitive-cause"], result: "synthetic-sensitive-partial-answer" },
+  }) }, signal());
+  const rejected = assert.rejects(request, error => {
+    assert.equal(error.message, "Claude process cleanup could not be confirmed.");
+    assert.equal(error.diagnostics.failureCategory, "invalid_result");
+    assert.equal(error.diagnostics.failureReason, "cli_error_result");
+    assert.equal(error.diagnostics.cliResultSubtype, "error_max_turns");
+    assert.equal(error.diagnostics.phase, "inference");
+    assert.equal(error.diagnostics.exitObserved, false);
+    assert.equal(error.diagnostics.closeObserved, false);
+    assert.equal(error.diagnostics.cleanupStatus, "unconfirmed");
+    assert.doesNotMatch(error.message + JSON.stringify(error.diagnostics), /synthetic-sensitive/);
+    return true;
+  });
+  const pid = await waitForMarker(marker);
+  await rejected;
+  assertExited(assert, pid);
+});
 
 test("already cancelled requests do not start the executable", async (t) => {
   const { directory } = await fixture(t);
@@ -293,6 +346,11 @@ for (const [request, options, category, phase] of [
         assert.ok(error instanceof ClaudeExecutionError);
         assert.equal(error.diagnostics.failureCategory, category);
         assert.equal(error.diagnostics.phase, phase);
+        assert.equal(error.diagnostics.failureReason, {
+          "result-then-invalid": "invalid_json", "truncated-utf8": "invalid_utf8",
+          "unterminated-line": "incomplete_frame",
+        }[request.fault ?? options.fault] ?? null);
+        assert.equal(error.diagnostics.cliResultSubtype, null);
         assert.equal(error.diagnostics.cleanupStatus, "close_observed");
         assert.doesNotMatch(error.message + JSON.stringify(error.diagnostics), /synthetic-sensitive|xxxx/);
         return true;

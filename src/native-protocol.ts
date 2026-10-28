@@ -45,8 +45,24 @@ export type ProtocolPhase = "initialize" | "settings_before" | "inference" |
   "settings_after" | "closing";
 export type ProtocolActivity = "response" | "retry";
 
+const cliResultSubtypeSchema = z.enum([
+  "error_during_execution", "error_max_turns", "error_max_budget_usd",
+  "error_max_structured_output_retries",
+]);
+export type CliResultSubtype = z.infer<typeof cliResultSubtypeSchema>;
+export type InvalidResultReason = "invalid_utf8" | "invalid_json" | "invalid_frame" |
+  "invalid_result_shape" | "cli_error_result" | "incomplete_frame" | "unexpected_exception";
+export type ResultFailureDetails = {
+  failureReason: InvalidResultReason;
+  cliResultSubtype: CliResultSubtype | null;
+};
+
 export class NativeProtocolError extends Error {
-  constructor(message: string, readonly category: "protocol" | "invalid_result" = "protocol") {
+  constructor(
+    message: string,
+    readonly category: "protocol" | "invalid_result" = "protocol",
+    readonly details?: ResultFailureDetails,
+  ) {
     super(message);
     this.name = "NativeProtocolError";
   }
@@ -147,7 +163,8 @@ export class NativeProtocol {
   receive(value: unknown): ProtocolActivity | undefined {
     const parsedFrame = recordSchema.safeParse(value);
     if (!parsedFrame.success || typeof parsedFrame.data.type !== "string") {
-      throw new NativeProtocolError("Claude Code returned an invalid stream frame.", "invalid_result");
+      throw new NativeProtocolError("Claude Code returned an invalid stream frame.", "invalid_result",
+        { failureReason: "invalid_frame", cliResultSubtype: null });
     }
     const frame = parsedFrame.data;
     if (frame.type === "control_request") {
@@ -232,10 +249,20 @@ export class NativeProtocol {
       if (this.phase !== "inference" || this.result !== undefined) {
         throw new NativeProtocolError("Claude Code returned an out-of-order result.");
       }
+      // Recognize only the declaration; raw error bodies and unknown subtypes
+      // never enter diagnostics. A declared failure is never an assessment.
+      const declaredError = cliResultSubtypeSchema.safeParse(frame.subtype);
+      if (frame.is_error === true && declaredError.success) {
+        throw new NativeProtocolError(
+          `Claude Code reported an unsuccessful result (${declaredError.data}).`,
+          "invalid_result",
+          { failureReason: "cli_error_result", cliResultSubtype: declaredError.data },
+        );
+      }
       const result = resultSchema.safeParse(frame);
       if (!result.success) {
-        throw new NativeProtocolError("Claude Code returned an invalid or unsuccessful JSON result.",
-          "invalid_result");
+        throw new NativeProtocolError("Claude Code returned an invalid result envelope.",
+          "invalid_result", { failureReason: "invalid_result_shape", cliResultSubtype: null });
       }
       const usage = modelUsageSchema.safeParse(result.data.modelUsage);
       const modelIds = usage.success ? Object.keys(usage.data) : [];

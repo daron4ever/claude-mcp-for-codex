@@ -123,7 +123,9 @@ function runPrompt() {
     case "invalid-utf8": process.stdout.write(Buffer.from([0xc3, 0x28])); break;
     case "envelope-error":
       emit({ type: "result", subtype: "error_during_execution", is_error: true,
-        result: "synthetic-sensitive-error-result" }); break;
+        session_id: session, errors: ["synthetic-sensitive-error-result"] }); break;
+    case "result-frame": ready(); emit(request.frame); break;
+    case "invalid-frame": emit(null); break;
     case "empty": answer(""); break;
     case "stdout-overflow": process.stdout.write("x".repeat(1_048_577)); break;
     case "stderr-overflow": process.stderr.write("x".repeat(65_537)); answer("answer"); break;
