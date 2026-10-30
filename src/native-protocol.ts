@@ -50,12 +50,27 @@ const cliResultSubtypeSchema = z.enum([
   "error_max_structured_output_retries",
 ]);
 export type CliResultSubtype = z.infer<typeof cliResultSubtypeSchema>;
+// Published SDK categories only; never classify by searching error text.
+const cliAssistantErrorSchema = z.enum([
+  "authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required",
+  "billing_error", "rate_limit", "overloaded", "invalid_request", "model_not_found",
+  "server_error", "unknown", "max_output_tokens", "cloud_credential_error",
+]);
+type CliAssistantError = z.infer<typeof cliAssistantErrorSchema>;
+type AssistantErrorState = "reported" | "not_observed" | "unrecognized" | "invalid" |
+  "uncorrelated" | "conflicting" | "superseded";
+export type CliErrorEvidence = {
+  cliApiErrorStatus: number | null;
+  cliApiErrorStatusState: "reported" | "explicit_null" | "missing" | "invalid" | "not_applicable";
+  cliPrecedingAssistantError: CliAssistantError | null;
+  cliPrecedingAssistantErrorState: AssistantErrorState | "not_applicable";
+};
 export type InvalidResultReason = "invalid_utf8" | "invalid_json" | "invalid_frame" |
   "invalid_result_shape" | "cli_error_result" | "incomplete_frame" | "unexpected_exception";
 export type ResultFailureDetails = {
   failureReason: InvalidResultReason;
   cliResultSubtype: CliResultSubtype | null;
-};
+} & Partial<CliErrorEvidence>;
 
 export class NativeProtocolError extends Error {
   constructor(
@@ -81,6 +96,7 @@ const resultSchema = z.object({
 const modelUsageSchema = z.record(reportedModelIdSchema, z.object({}))
   .refine((usage) => Object.keys(usage).length <= 16);
 const sessionSchema = z.string().min(1).max(256);
+const apiErrorStatusSchema = z.number().int().min(100).max(599);
 const assistantMessageSchema = z.object({
   role: z.literal("assistant"),
   model: reportedModelIdSchema,
@@ -130,6 +146,9 @@ export class NativeProtocol {
   private initObserved = false;
   private evidenceInvalid = false;
   private evidenceMissing = false;
+  // Independent of answer verification; no raw messages or extra session IDs retained.
+  private precedingAssistantError: CliAssistantError | null = null;
+  private precedingAssistantErrorState: AssistantErrorState = "not_observed";
   private result: {
     answer: string;
     modelIds: string[];
@@ -158,6 +177,85 @@ export class NativeProtocol {
     if (value === undefined || value === null || value === "") this.evidenceMissing = true;
     else this.evidenceInvalid = true;
     return undefined;
+  }
+
+  private hasPendingAssistantError(): boolean {
+    return this.precedingAssistantErrorState !== "not_observed" &&
+      this.precedingAssistantErrorState !== "superseded";
+  }
+
+  private clearAssistantError(state: AssistantErrorState): void {
+    this.precedingAssistantError = null;
+    this.precedingAssistantErrorState = state;
+  }
+
+  private observeAssistantError(frame: Record<string, unknown>): void {
+    const hasError = frame.error !== undefined;
+    const pending = this.hasPendingAssistantError();
+    if (!hasError && !pending) return;
+    if (frame.parent_tool_use_id !== null) {
+      // Explicit auxiliary frames do not change main-session evidence.
+      if (!sessionSchema.safeParse(frame.parent_tool_use_id).success && (hasError || pending)) {
+        this.clearAssistantError("uncorrelated");
+      }
+      return;
+    }
+    const session = sessionSchema.safeParse(frame.session_id);
+    if (!session.success || this.systemSession === undefined || session.data !== this.systemSession) {
+      if (hasError || pending) this.clearAssistantError("uncorrelated");
+      return;
+    }
+    if (!hasError) {
+      if (assistantMessageSchema.safeParse(frame.message).success) {
+        if (this.precedingAssistantErrorState !== "not_observed") {
+          this.clearAssistantError("superseded");
+        }
+      } else if (pending) this.clearAssistantError("invalid");
+      return;
+    }
+    // Synthetic API-error messages need not carry an ordinary answer-model ID.
+    const message = recordSchema.safeParse(frame.message);
+    if (!message.success || message.data.role !== "assistant") {
+      this.clearAssistantError("invalid");
+      return;
+    }
+    const category = cliAssistantErrorSchema.safeParse(frame.error);
+    if (!category.success) {
+      this.clearAssistantError(typeof frame.error === "string" ? "unrecognized" : "invalid");
+      return;
+    }
+    if (this.precedingAssistantErrorState === "reported") {
+      if (this.precedingAssistantError !== category.data) this.clearAssistantError("conflicting");
+    } else if (!pending) {
+      this.precedingAssistantError = category.data;
+      this.precedingAssistantErrorState = "reported";
+    }
+    // Ambiguous evidence stays unavailable until a correlated response/retry supersedes it.
+  }
+
+  private errorEvidence(frame: Record<string, unknown>, subtype: CliResultSubtype): CliErrorEvidence {
+    let cliApiErrorStatus: number | null = null;
+    let cliApiErrorStatusState: CliErrorEvidence["cliApiErrorStatusState"] = "not_applicable";
+    if (subtype === "success") {
+      const status = apiErrorStatusSchema.safeParse(frame.api_error_status);
+      if (!Object.hasOwn(frame, "api_error_status")) cliApiErrorStatusState = "missing";
+      else if (frame.api_error_status === null) cliApiErrorStatusState = "explicit_null";
+      else if (status.success) {
+        cliApiErrorStatus = status.data;
+        cliApiErrorStatusState = "reported";
+      } else cliApiErrorStatusState = "invalid";
+    }
+    const session = sessionSchema.safeParse(frame.session_id);
+    const correlated = session.success && this.systemSession !== undefined &&
+      session.data === this.systemSession;
+    const cliPrecedingAssistantErrorState = this.precedingAssistantErrorState === "reported" &&
+      !correlated ? "uncorrelated" : this.precedingAssistantErrorState;
+    return {
+      cliApiErrorStatus, cliApiErrorStatusState,
+      cliPrecedingAssistantError: cliPrecedingAssistantErrorState === "reported" ?
+        this.precedingAssistantError : null,
+      cliPrecedingAssistantErrorState,
+    };
   }
 
   receive(value: unknown): ProtocolActivity | undefined {
@@ -216,6 +314,7 @@ export class NativeProtocol {
         })) {
         throw new NativeProtocolError("Claude Code attempted an unsupported tool operation.");
       }
+      this.observeAssistantError(frame);
       // Auxiliary messages never establish main-answer evidence.
       if (frame.parent_tool_use_id !== null) {
         if (frame.parent_tool_use_id === undefined) this.evidenceMissing = true;
@@ -254,10 +353,18 @@ export class NativeProtocol {
       // enter diagnostics. A declared failure is never an assessment.
       const declaredError = cliResultSubtypeSchema.safeParse(frame.subtype);
       if (frame.is_error === true && declaredError.success) {
+        const evidence = this.errorEvidence(frame, declaredError.data);
+        const summary = [
+          ...(evidence.cliApiErrorStatus === null ? [] :
+            [`cliApiErrorStatus=${evidence.cliApiErrorStatus}`]),
+          ...(evidence.cliPrecedingAssistantError === null ? [] :
+            [`cliPrecedingAssistantError=${evidence.cliPrecedingAssistantError}`]),
+        ];
         throw new NativeProtocolError(
-          `Claude Code reported an unsuccessful result (${declaredError.data}).`,
+          `Claude Code reported an unsuccessful result (${declaredError.data}).` +
+            (summary.length === 0 ? "" : " " + summary.join(" ")),
           "invalid_result",
-          { failureReason: "cli_error_result", cliResultSubtype: declaredError.data },
+          { failureReason: "cli_error_result", cliResultSubtype: declaredError.data, ...evidence },
         );
       }
       const result = resultSchema.safeParse(frame);
@@ -277,8 +384,16 @@ export class NativeProtocol {
       this.control(this.ids.after, { subtype: "get_settings" });
       if (this.resultSession !== undefined) return "response";
     } else if (frame.type === "system" && frame.subtype === "api_retry" &&
-      this.phase === "inference" && retrySchema.safeParse(frame).success) {
-      return "retry";
+      this.phase === "inference") {
+      const retry = retrySchema.safeParse(frame);
+      if (retry.success) {
+        if (this.hasPendingAssistantError()) {
+          this.clearAssistantError(this.systemSession !== undefined &&
+            retry.data.session_id === this.systemSession ? "superseded" : "uncorrelated");
+        }
+        return "retry";
+      }
+      if (this.hasPendingAssistantError()) this.clearAssistantError("invalid");
     }
     // Other notifications are ignored, but still consume the cumulative output budget.
   }

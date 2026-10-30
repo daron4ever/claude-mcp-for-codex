@@ -5,6 +5,7 @@ import { modelSchema, effortSchema, type Config } from "./config.js";
 import {
   NativeProtocol, NativeProtocolError, type ClaudeResult, type CliResultSubtype,
   type InvalidResultReason, type ResultFailureDetails,
+  type CliErrorEvidence,
 } from "./native-protocol.js";
 import { ProgressReporter, type ClaudeProgress, type ProgressObserver } from "./progress.js";
 export { outputSchema, type ClaudeResult } from "./native-protocol.js";
@@ -31,7 +32,7 @@ export type ClaudeInput = z.infer<typeof inputSchema>;
 type FailureCategory = "timeout" | "cancelled" | "spawn" | "stdin" | "stdout" |
   "stderr" | "stdout_limit" | "stderr_limit" | "cli_exit" | "invalid_result" | "protocol" | "cleanup";
 
-export type ClaudeFailureDiagnostics = ClaudeProgress & {
+export type ClaudeFailureDiagnostics = ClaudeProgress & CliErrorEvidence & {
   failureCategory: FailureCategory;
   failureReason: InvalidResultReason | null;
   cliResultSubtype: CliResultSubtype | null;
@@ -175,6 +176,10 @@ function invokeClaude(
         failureCategory,
         failureReason: details?.failureReason ?? null,
         cliResultSubtype: details?.cliResultSubtype ?? null,
+        cliApiErrorStatus: details?.cliApiErrorStatus ?? null,
+        cliApiErrorStatusState: details?.cliApiErrorStatusState ?? "not_applicable",
+        cliPrecedingAssistantError: details?.cliPrecedingAssistantError ?? null,
+        cliPrecedingAssistantErrorState: details?.cliPrecedingAssistantErrorState ?? "not_applicable",
         ...progress(),
         timeoutMs: config.timeoutMs,
         firstStdoutMs,
