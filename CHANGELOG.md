@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Add validated CLI-reported terminal status and correlated preceding assistant-error categories with explicit availability states to failure diagnostics; keep raw errors private and preserve assessment rejection, settings verification, first-failure snapshots and existing lifecycle limits.
+
 - Classify API-error results with `subtype: "success"` and `is_error: true` as CLI-declared failures instead of invalid result shapes; preserve assessment rejection, private error text, settings verification and bounded cleanup.
 
 - Update the MCP SDK to 1.32.2, Zod to 4.6.7 and affected transitive dependencies to clear dependency audit findings while preserving the existing CI security gates and stdio behavior.

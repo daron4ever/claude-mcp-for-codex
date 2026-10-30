@@ -62,6 +62,143 @@ test("CLI readbacks and main answer establish bounded session evidence, independ
   assert.deepEqual(result.metadata.cliReportedModelIds, ["claude-haiku-4-5"]);
 });
 
+function assistantError(error = "rate_limit", fields = {}) {
+  return { type: "assistant", parent_tool_use_id: null, session_id: sessionId, error,
+    message: { role: "assistant", model: "<synthetic>",
+      content: [{ type: "text", text: "synthetic-sensitive-error-body" }] }, ...fields };
+}
+function declaredFailure(frames = [], fields = {}, { init = true } = {}) {
+  const c = conversation(); c.reply({}); c.reply({ applied: settings });
+  if (init) c.protocol.receive({ type: "system", subtype: "init", session_id: sessionId });
+  for (const frame of frames) c.protocol.receive(frame);
+  let failure;
+  assert.throws(() => c.protocol.receive({ type: "result", subtype: "success", is_error: true,
+    result: "synthetic-sensitive-result-body", session_id: sessionId, ...fields }), error => {
+    failure = error;
+    assert.equal(error.category, "invalid_result");
+    assert.equal(error.details.failureReason, "cli_error_result");
+    assert.doesNotMatch(error.message + JSON.stringify(error), /synthetic-sensitive|<synthetic>/);
+    return true;
+  });
+  assert.throws(() => c.protocol.complete(), /before completing/);
+  assert.equal(c.sent.filter(frame => frame.type === "control_request").length, 2);
+  assert.equal(c.eof(), 0);
+  return failure;
+}
+
+test("declared errors expose correlated category and terminal status without raw error bodies", () => {
+  const failure = declaredFailure([assistantError()], { api_error_status: 429 });
+  assert.equal(failure.details.cliApiErrorStatus, 429);
+  assert.equal(failure.details.cliApiErrorStatusState, "reported");
+  assert.equal(failure.details.cliPrecedingAssistantError, "rate_limit");
+  assert.equal(failure.details.cliPrecedingAssistantErrorState, "reported");
+});
+
+test("only published assistant categories are reported, including literal unknown", () => {
+  for (const category of ["authentication_failed", "oauth_org_not_allowed", "account_on_hold",
+    "verification_required", "billing_error", "rate_limit", "overloaded", "invalid_request",
+    "model_not_found", "server_error", "unknown", "max_output_tokens", "cloud_credential_error"]) {
+    const failure = declaredFailure([assistantError(category)]);
+    assert.equal(failure.details.cliPrecedingAssistantError, category);
+    assert.equal(failure.details.cliPrecedingAssistantErrorState, "reported");
+    assert.match(failure.message, new RegExp(`cliPrecedingAssistantError=${category}`));
+  }
+});
+
+test("terminal API status distinguishes absent, null and invalid values without coercion", () => {
+  const cases = [[{}, null, "missing"], [{ api_error_status: null }, null, "explicit_null"],
+    ...[100, 200, 401, 429, 599].map(value => [{ api_error_status: value }, value, "reported"]),
+    ...[undefined, "401", "synthetic-sensitive-status", 99, 600, -1, 401.5, NaN, Infinity,
+      true, [], { secret: "synthetic-sensitive" }].map(value =>
+      [{ api_error_status: value }, null, "invalid"])];
+  for (const [fields, value, state] of cases) {
+    const failure = declaredFailure([], fields);
+    assert.equal(failure.details.cliApiErrorStatus, value);
+    assert.equal(failure.details.cliApiErrorStatusState, state);
+    assert.equal(failure.details.cliPrecedingAssistantErrorState, "not_observed");
+  }
+  const failure = declaredFailure([assistantError()], {
+    subtype: "error_max_turns", api_error_status: 429,
+  });
+  assert.equal(failure.details.cliApiErrorStatus, null);
+  assert.equal(failure.details.cliApiErrorStatusState, "not_applicable");
+  assert.equal(failure.details.cliPrecedingAssistantError, "rate_limit");
+});
+
+const ordinaryAssistant = { type: "assistant", parent_tool_use_id: null, session_id: sessionId,
+  message: { role: "assistant", model: settings.model, content: [{ type: "text", text: "answer" }] } };
+const retryFrame = { type: "system", subtype: "api_retry", session_id: sessionId,
+  attempt: 1, max_retries: 2, retry_delay_ms: 0, error_status: 529,
+  error: "synthetic-sensitive-retry-error" };
+
+test("assistant error evidence rejects uncertain identity, malformed and conflicting segments", () => {
+  const cases = [
+    [[assistantError("rate_limit", { parent_tool_use_id: "synthetic-sensitive-auxiliary" })],
+      {}, {}, "not_observed"],
+    ...[undefined, 7, ""].map(parent_tool_use_id => [
+      [assistantError("rate_limit", { parent_tool_use_id })], {}, {}, "uncorrelated"]),
+    ...[undefined, null, "", 7, "synthetic-sensitive-other"].map(session_id => [
+      [assistantError("rate_limit", { session_id })], {}, {}, "uncorrelated"]),
+    ...[undefined, null, 7, { role: "user" }].map(message => [
+      [assistantError("rate_limit", { message })], {}, {}, "invalid"]),
+    [[assistantError()], {}, { init: false }, "uncorrelated"],
+    [[assistantError()], { session_id: "synthetic-sensitive-other" }, {}, "uncorrelated"],
+    [[assistantError()], { session_id: undefined }, {}, "uncorrelated"],
+    [[assistantError("synthetic-sensitive-unknown")], {}, {}, "unrecognized"],
+    ...[null, 7, [], { secret: "synthetic-sensitive" }].map(value => [
+      [assistantError(value)], {}, {}, "invalid"]),
+    [[assistantError(), assistantError("server_error"), assistantError()], {}, {}, "conflicting"],
+    [[assistantError(), assistantError("synthetic-sensitive-unknown")], {}, {}, "unrecognized"],
+    [[assistantError("synthetic-sensitive-unknown"), assistantError()], {}, {}, "unrecognized"],
+    [[assistantError(), assistantError(null)], {}, {}, "invalid"],
+    [[assistantError(), { ...ordinaryAssistant, parent_tool_use_id: undefined }], {}, {}, "uncorrelated"],
+    [[assistantError(), { ...ordinaryAssistant, message: null }], {}, {}, "invalid"],
+    [[assistantError(), { ...retryFrame, error_status: "synthetic-sensitive" }], {}, {}, "invalid"],
+    [[assistantError(), { ...retryFrame, session_id: "synthetic-sensitive-other" }], {}, {}, "uncorrelated"],
+    [[assistantError(), { type: "system", subtype: "init", session_id: sessionId }],
+      {}, { init: false }, "uncorrelated"],
+  ];
+  for (const [frames, fields, options, state] of cases) {
+    const failure = declaredFailure(frames, fields, options);
+    assert.equal(failure.details.cliPrecedingAssistantError, null);
+    assert.equal(failure.details.cliPrecedingAssistantErrorState, state);
+  }
+});
+
+test("only correlated recovery supersedes errors; later fresh errors can be reported", () => {
+  for (const recovery of [ordinaryAssistant, retryFrame]) {
+    const failure = declaredFailure([assistantError(), recovery]);
+    assert.equal(failure.details.cliPrecedingAssistantError, null);
+    assert.equal(failure.details.cliPrecedingAssistantErrorState, "superseded");
+    const fresh = declaredFailure([assistantError(), recovery, assistantError("server_error")]);
+    assert.equal(fresh.details.cliPrecedingAssistantError, "server_error");
+    assert.equal(fresh.details.cliPrecedingAssistantErrorState, "reported");
+    const conflictRecovered = declaredFailure([
+      assistantError(), assistantError("server_error"), recovery, assistantError("billing_error"),
+    ]);
+    assert.equal(conflictRecovered.details.cliPrecedingAssistantError, "billing_error");
+  }
+  const same = declaredFailure([assistantError(), assistantError(), assistantError("server_error", {
+    parent_tool_use_id: "synthetic-sensitive-auxiliary",
+  })]);
+  assert.equal(same.details.cliPrecedingAssistantError, "rate_limit");
+  assert.equal(declaredFailure().details.cliPrecedingAssistantErrorState, "not_observed");
+});
+
+test("error observations do not become success metadata or relax existing verification", () => {
+  const c = conversation(); c.reply({}); c.reply({ applied: settings });
+  c.protocol.receive({ type: "system", subtype: "init", session_id: sessionId });
+  c.protocol.receive(assistantError());
+  c.protocol.receive(retryFrame);
+  answer(c, { omitInit: true }); c.reply({ applied: settings });
+  const result = c.protocol.complete();
+  assert.equal(result.answer, "answer");
+  assert.equal(result.metadata.settingsEvidence.status, "invalid");
+  assert.equal(result.metadata.effectiveModelVerified, false);
+  assert.equal(result.metadata.effectiveEffortVerified, false);
+  assert.doesNotMatch(JSON.stringify(result), /cliApiError|cliPreceding|rate_limit|synthetic-sensitive/);
+});
+
 test("recognized unsuccessful result declarations expose only allowlisted classification", () => {
   for (const subtype of ["success", "error_during_execution", "error_max_turns", "error_max_budget_usd",
     "error_max_structured_output_retries"]) {
@@ -70,7 +207,9 @@ test("recognized unsuccessful result declarations expose only allowlisted classi
       errors: ["synthetic-sensitive-cause"], session_id: sessionId,
       result: "synthetic-sensitive-assessment", settings: { secret: "synthetic-sensitive" } }), error => {
       assert.equal(error.category, "invalid_result");
-      assert.deepEqual(error.details, { failureReason: "cli_error_result", cliResultSubtype: subtype });
+      assert.deepEqual(error.details, { failureReason: "cli_error_result", cliResultSubtype: subtype,
+        cliApiErrorStatus: null, cliApiErrorStatusState: subtype === "success" ? "missing" : "not_applicable",
+        cliPrecedingAssistantError: null, cliPrecedingAssistantErrorState: "not_observed" });
       assert.match(error.message, new RegExp(subtype));
       assert.doesNotMatch(JSON.stringify(error) + error.message, /synthetic-sensitive/);
       return true;

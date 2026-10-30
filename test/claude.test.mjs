@@ -201,6 +201,10 @@ test("success-subtype API errors fail privately, clean up and permit the next ca
     assert.equal(error.diagnostics.failureCategory, "invalid_result");
     assert.equal(error.diagnostics.failureReason, "cli_error_result");
     assert.equal(error.diagnostics.cliResultSubtype, "success");
+    assert.equal(error.diagnostics.cliApiErrorStatus, 401);
+    assert.equal(error.diagnostics.cliApiErrorStatusState, "reported");
+    assert.equal(error.diagnostics.cliPrecedingAssistantError, null);
+    assert.equal(error.diagnostics.cliPrecedingAssistantErrorState, "not_observed");
     assert.equal(error.diagnostics.phase, "inference");
     assert.equal(error.diagnostics.cleanupStatus, "close_observed");
     assert.doesNotMatch(error.message + JSON.stringify(error),
@@ -211,6 +215,91 @@ test("success-subtype API errors fail privately, clean up and permit the next ca
   await rejected;
   assertExited(assert, pid);
   assert.equal((await runner.run({ prompt: "next call works" }, signal())).answer, "next call works");
+});
+
+function diagnosticFrames(category, status) {
+  return [
+    { type: "assistant", parent_tool_use_id: null, error: category,
+      message: { role: "assistant", model: "<synthetic>",
+        content: [{ type: "text", text: "synthetic-sensitive-error-body" }] } },
+    { type: "result", subtype: "success", is_error: true, api_error_status: status,
+      result: "synthetic-sensitive-terminal-error", settings: { secret: "synthetic-sensitive" } },
+  ];
+}
+
+test("error observations stay isolated across concurrent and subsequent invocations", async t => {
+  const { binary } = await fixture(t);
+  const runner = makeRunner(t, binary);
+  await Promise.all([["rate_limit", 429], ["authentication_failed", 401]].map(async ([category, status]) => {
+    await assert.rejects(runner.run({ model: "opus", effort: "xhigh",
+      prompt: JSON.stringify({ scenario: "progress", frames: diagnosticFrames(category, status) }),
+    }, signal()), error => {
+      assert.equal(error.diagnostics.cliApiErrorStatus, status);
+      assert.equal(error.diagnostics.cliApiErrorStatusState, "reported");
+      assert.equal(error.diagnostics.cliPrecedingAssistantError, category);
+      assert.equal(error.diagnostics.cliPrecedingAssistantErrorState, "reported");
+      assert.equal(error.diagnostics.responseEventCount, 0);
+      assert.equal(error.diagnostics.retryEventCount, 0);
+      assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+      assert.doesNotMatch(error.message + JSON.stringify(error), /synthetic-sensitive|<synthetic>/);
+      return true;
+    });
+  }));
+  const result = await runner.run({ prompt: "still usable" }, signal());
+  assert.equal(result.answer, "still usable");
+  assert.equal(result.metadata.settingsEvidence.status, "verified");
+  assert.doesNotMatch(JSON.stringify(result), /cliApiError|cliPreceding/);
+});
+
+test("cleanup failure, later cancellation and buffered output preserve first error observations", async t => {
+  const { binary } = await fixture(t);
+  const controller = new AbortController();
+  const originalKill = process.kill;
+  t.mock.method(process, "kill", function (target, signalName) {
+    if (target < 0 && signalName === "SIGTERM") {
+      controller.abort();
+      throw Object.assign(new Error("synthetic-sensitive-cleanup-error"), { code: "EPERM" });
+    }
+    return originalKill.call(process, target, signalName);
+  });
+  const frames = [...diagnosticFrames("rate_limit", 429), ...diagnosticFrames("billing_error", 402)];
+  await assert.rejects(makeRunner(t, binary).run({
+    prompt: JSON.stringify({ scenario: "progress", frames }),
+  }, controller.signal), error => {
+    assert.equal(error.message, "Claude process cleanup could not be confirmed.");
+    assert.equal(error.diagnostics.failureCategory, "invalid_result");
+    assert.equal(error.diagnostics.failureReason, "cli_error_result");
+    assert.equal(error.diagnostics.cliApiErrorStatus, 429);
+    assert.equal(error.diagnostics.cliPrecedingAssistantError, "rate_limit");
+    assert.equal(error.diagnostics.cliApiErrorStatusState, "reported");
+    assert.equal(error.diagnostics.cliPrecedingAssistantErrorState, "reported");
+    assert.equal(error.diagnostics.cleanupStatus, "unconfirmed");
+    assert.doesNotMatch(JSON.stringify(error), /synthetic-sensitive|billing_error/);
+    return true;
+  });
+});
+
+test("cancellation does not promote preceding CLI errors into a terminal cause", async t => {
+  const { binary, directory } = await fixture(t);
+  const marker = resolve(directory, "ready");
+  const controller = new AbortController();
+  const request = makeRunner(t, binary).run({ prompt: JSON.stringify({ scenario: "progress",
+    frames: diagnosticFrames("rate_limit", 429).slice(0, 1), hang: true, marker,
+  }) }, controller.signal);
+  const rejected = assert.rejects(request, error => {
+    assert.equal(error.diagnostics.failureCategory, "cancelled");
+    assert.equal(error.diagnostics.cliApiErrorStatus, null);
+    assert.equal(error.diagnostics.cliPrecedingAssistantError, null);
+    assert.equal(error.diagnostics.cliApiErrorStatusState, "not_applicable");
+    assert.equal(error.diagnostics.cliPrecedingAssistantErrorState, "not_applicable");
+    assert.equal(error.diagnostics.cleanupStatus, "close_observed");
+    assert.doesNotMatch(JSON.stringify(error), /rate_limit|synthetic-sensitive/);
+    return true;
+  });
+  const pid = await waitForMarker(marker);
+  controller.abort();
+  await rejected;
+  assertExited(assert, pid);
 });
 
 test("cleanup errors cannot overwrite the original declared-failure classification", async t => {

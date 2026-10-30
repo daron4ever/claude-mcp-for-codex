@@ -340,6 +340,10 @@ A second text block remains labeled
   "failureCategory": "timeout",
   "failureReason": null,
   "cliResultSubtype": null,
+  "cliApiErrorStatus": null,
+  "cliApiErrorStatusState": "not_applicable",
+  "cliPrecedingAssistantError": null,
+  "cliPrecedingAssistantErrorState": "not_applicable",
   "phase": "initialize",
   "elapsedMs": 300004,
   "responseEventCount": 0,
@@ -405,9 +409,49 @@ cause from the subtype alone. Valid assessments still require `is_error: false`
 and all existing success checks. Increasing the deadline cannot fix this early
 CLI-declared failure.
 
+For `cli_error_result`, the bridge also projects structured CLI observations:
+
+| Field | Meaning |
+| --- | --- |
+| `cliApiErrorStatus` | An integer from 100 through 599, or `null`, read only from the terminal `success`/`is_error: true` result's `api_error_status`. |
+| `cliApiErrorStatusState` | `reported`, `explicit_null`, `missing`, `invalid`, or `not_applicable`. Other result subtypes do not establish this field. |
+| `cliPrecedingAssistantError` | An allowlisted preceding main-assistant error category, or `null`. This is an observation, not a verified terminal cause. |
+| `cliPrecedingAssistantErrorState` | `reported`, `not_observed`, `unrecognized`, `invalid`, `uncorrelated`, `conflicting`, `superseded`, or `not_applicable`. |
+
+The category allowlist follows the published SDK contract:
+`authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`,
+`verification_required`, `billing_error`, `rate_limit`, `overloaded`,
+`invalid_request`, `model_not_found`, `server_error`, `unknown`,
+`max_output_tokens`, and `cloud_credential_error`. A literal CLI category `unknown`
+is distinct from an unrecognized arbitrary string; arbitrary values are never echoed.
+
+Reporting a category requires an explicit top-level assistant frame, an assistant
+role, and a session matching both initialization and the final failed result.
+Synthetic error frames do not need an ordinary answering-model ID. Explicit
+auxiliary frames are ignored. Missing or invalid attribution is `uncorrelated`;
+malformed category/envelope data is `invalid`. Different recognized categories in
+an unresolved segment are `conflicting`, with no selected category. A later valid,
+correlated ordinary response or retry supersedes earlier error evidence; a fresh
+error after that transition can establish a new candidate. Unrecognized or
+malformed relevant evidence cannot silently expose an older category.
+
+For example, a synthetic failure could report `cliApiErrorStatus: 429` and
+`cliPrecedingAssistantError: "rate_limit"`, each with state `reported`. These are
+separate CLI-reported observations: no category is inferred from a status, and
+neither proves the provider/account root cause or credential validity. Retry-event
+status/category values are not used as terminal error evidence. If the CLI omits
+the information, the availability states explain that limitation; the bridge does
+not read private logs or make another Claude request to fill the gap. Existing
+saved failures cannot be enriched retrospectively.
+
+For other failure reasons/categories these values are `null` with states
+`not_applicable`. They never appear in successful answer metadata. Available
+validated status/category values also appear in the short error message; raw
+result/error text, session/request IDs and account details remain private.
+
 ```text
-Rejected output -> fixed reason + known CLI subtype -> error diagnostics
-                -> discard assessment -> unchanged bounded cleanup
+CLI error -> validated terminal status + correlated preceding category (or unavailable)
+          -> frozen error diagnostics -> discard assessment -> bounded cleanup
 ```
 
 These fields share the frozen initial-failure boundary. A later cleanup error

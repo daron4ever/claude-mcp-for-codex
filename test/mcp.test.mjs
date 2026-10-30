@@ -85,6 +85,49 @@ test("MCP error diagnostics distinguish parse failures from declared CLI failure
 
 const progressPattern = /^phase=(initialize|settings_before|inference|settings_after|closing) elapsedMs=\d+ responseEvents=\d+ lastResponseAgeMs=(\d+|none_observed) retryEvents=\d+$/;
 
+test("MCP projects safe error observations and unavailable states without assessments", async t => {
+  const { client } = await connect(t);
+  const cases = [
+    { category: "rate_limit", status: 429, expectedCategory: "rate_limit",
+      categoryState: "reported", expectedStatus: 429, statusState: "reported", chunked: true },
+    { category: "authentication_failed", status: 401, expectedCategory: "authentication_failed",
+      categoryState: "reported", expectedStatus: 401, statusState: "reported" },
+    { category: "synthetic-sensitive-category", status: { token: "synthetic-sensitive" },
+      expectedCategory: null, categoryState: "unrecognized", expectedStatus: null, statusState: "invalid" },
+    { category: "billing_error", status: null, parent: "synthetic-sensitive-auxiliary",
+      expectedCategory: null, categoryState: "not_observed", expectedStatus: null, statusState: "explicit_null" },
+  ];
+  await Promise.all(cases.map(async item => {
+    const result = await client.callTool({ name: "ask_claude", arguments: {
+      model: "opus", effort: "xhigh", prompt: JSON.stringify({ scenario: "progress",
+        chunked: item.chunked, frames: [
+          { type: "assistant", parent_tool_use_id: item.parent ?? null, error: item.category,
+            message: { role: "assistant", model: "<synthetic>",
+              content: [{ type: "text", text: "synthetic-sensitive-error-body" }] } },
+          { type: "result", subtype: "success", is_error: true, api_error_status: item.status,
+            result: "synthetic-sensitive-result", request_id: "synthetic-sensitive-request" },
+        ] }),
+    } });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent, undefined);
+    const d = JSON.parse(result.content[1].text.split("\n").slice(1).join("\n"));
+    assert.equal(d.cliApiErrorStatus, item.expectedStatus);
+    assert.equal(d.cliApiErrorStatusState, item.statusState);
+    assert.equal(d.cliPrecedingAssistantError, item.expectedCategory);
+    assert.equal(d.cliPrecedingAssistantErrorState, item.categoryState);
+    assert.equal(d.failureReason, "cli_error_result");
+    assert.equal(d.cleanupStatus, "close_observed");
+    assert.doesNotMatch(JSON.stringify(result),
+      /synthetic-sensitive|<synthetic>|effectiveModelVerified|effectiveEffortVerified|session_id|request_id/);
+    if (item.expectedCategory) assert.match(result.content[0].text,
+      new RegExp(`cliPrecedingAssistantError=${item.expectedCategory}`));
+  }));
+  const success = await client.callTool({ name: "ask_claude", arguments: { prompt: "usable" } });
+  assert.equal(success.content[0].text, "usable");
+  assert.equal(success.structuredContent.metadata.settingsEvidence.status, "verified");
+  assert.doesNotMatch(JSON.stringify(success), /cliApiError|cliPreceding/);
+});
+
 test("SDK onprogress receives safe live observations before a verified answer", async t => {
   const { client } = await connect(t, {}, { afterDelayMs: 1300 });
   const updates = [];
@@ -454,10 +497,16 @@ test("MCP failures report per-call deadlines and never return partial assessment
       "stderrBytes", "exitObserved", "exitCode", "exitSignal", "closeObserved", "cleanupStatus",
       "responseEventCount", "lastResponseEventAgeMs", "retryEventCount",
       "failureReason", "cliResultSubtype",
+      "cliApiErrorStatus", "cliApiErrorStatusState",
+      "cliPrecedingAssistantError", "cliPrecedingAssistantErrorState",
     ].sort());
     assert.equal(diagnostics.failureCategory, "timeout");
     assert.equal(diagnostics.failureReason, null);
     assert.equal(diagnostics.cliResultSubtype, null);
+    assert.equal(diagnostics.cliApiErrorStatus, null);
+    assert.equal(diagnostics.cliApiErrorStatusState, "not_applicable");
+    assert.equal(diagnostics.cliPrecedingAssistantError, null);
+    assert.equal(diagnostics.cliPrecedingAssistantErrorState, "not_applicable");
     assert.equal(diagnostics.timeoutMs, 1_000);
     assert.ok(diagnostics.elapsedMs >= 1_000);
     assert.equal(diagnostics.closeObserved, false);
