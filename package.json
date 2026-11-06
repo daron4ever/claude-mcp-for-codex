@@ -11,7 +11,7 @@
   "bin": {
     "claude-mcp-for-codex": "dist/index.js"
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": ["dist", "README.md", "LICENSE", ".agents/skills/claude-consult"],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
