@@ -100,6 +100,60 @@ Or call the tool with:
 | `model` | Optional Claude Code alias or model ID; overrides `CLAUDE_DEFAULT_MODEL`. If neither is supplied, Claude Code selects its runtime default. |
 | `effort` | Optional `low`, `medium`, `high`, `xhigh`, or `max`; overrides `CLAUDE_DEFAULT_EFFORT`. If neither is supplied, Claude Code selects the effort. |
 
+## Optional project-scoped consultation skill
+
+This repository includes an instruction-only Codex skill at
+[`.agents/skills/claude-consult/SKILL.md`](.agents/skills/claude-consult/SKILL.md).
+It packages context preparation, argument selection, complete result retention,
+bounded reads, settings checks and reconciliation around the existing MCP tool.
+It does not change the server or automatically call Claude.
+
+Codex discovers project skills under `.agents/skills` from its working directory
+up to the Git repository root. Start Codex in this repository or a subfolder to
+use the bundled skill. A sibling repository needs its own project-scoped copy;
+placing a skill above separate Git roots should not be assumed sufficient. See
+[official skill discovery documentation](https://learn.chatgpt.com/docs/build-skills).
+
+For another project, copy the skill into that project's repository root, after
+checking that the destination does not already exist. From this checkout:
+
+```sh
+target_project="/absolute/path/to/your/project"
+mkdir -p "$target_project/.agents/skills"
+if [ ! -e "$target_project/.agents/skills/claude-consult" ] && \
+  [ ! -L "$target_project/.agents/skills/claude-consult" ]; then
+  cp -R .agents/skills/claude-consult "$target_project/.agents/skills/"
+else
+  echo "Destination exists; inspect it before updating."
+fi
+```
+
+These are optional manual installation commands; the server does not execute
+them. No user-scoped skill or configuration is installed. The skill is also
+included in package contents. No plugin registration or tool installation is
+performed. Keep the existing Claude MCP connection configured separately; skill
+scope and MCP configuration scope are independent.
+
+Invoke it in Codex with an authorized consultation, for example:
+
+```text
+$claude-consult Explain the tradeoffs in the approved task using opus/high.
+```
+
+It can also be selected automatically for matching requests; selection does not
+authorize a call. Verify that it appears in your client's skill selector. Current
+Codex detects skill updates automatically; if it does not appear, restart the
+client after protecting any session-only retained answers. Discovery is separate
+from successful MCP execution. Existing project policy still governs calls and
+formal reviews, including Codex-only review rules where applicable.
+
+Keep consultation triggers, access/approval rules and required verification in
+`AGENTS.md` so they apply even when the skill is not loaded. The skill carries
+the detailed mechanics; adopting it does not automatically remove duplicated
+instructions or edit any project's `AGENTS.md`. Result retention uses available
+client/session facilities, not server-side storage, and cannot recover an earlier
+unretained response. This workflow is not an authentication or timeout fix.
+
 ## Select context before consulting Claude
 
 Use Codex's existing code-navigation tools to gather relevant context before calling

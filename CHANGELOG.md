@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Bundle an optional project-scoped `claude-consult` Codex skill for sanitized task context, argument selection, retained-response coverage and evidence reconciliation; document project installation while preserving existing MCP and project-policy boundaries.
+
 - Add validated CLI-reported terminal status and correlated preceding assistant-error categories with explicit availability states to failure diagnostics; keep raw errors private and preserve assessment rejection, settings verification, first-failure snapshots and existing lifecycle limits.
 
 - Classify API-error results with `subtype: "success"` and `is_error: true` as CLI-declared failures instead of invalid result shapes; preserve assessment rejection, private error text, settings verification and bounded cleanup.
