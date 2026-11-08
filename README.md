@@ -96,7 +96,7 @@ Or call the tool with:
 
 | Input | Behavior |
 | --- | --- |
-| `prompt` | Required nonblank text, at most 100,000 UTF-8 bytes. |
+| `prompt` | Required nonblank text, at most 200,000 UTF-8 bytes. |
 | `model` | Optional Claude Code alias or model ID; overrides `CLAUDE_DEFAULT_MODEL`. If neither is supplied, Claude Code selects its runtime default. |
 | `effort` | Optional `low`, `medium`, `high`, `xhigh`, or `max`; overrides `CLAUDE_DEFAULT_EFFORT`. If neither is supplied, Claude Code selects the effort. |
 
@@ -203,7 +203,7 @@ After:  current task record + authorized source
 - Label excerpts with project-relative paths and original line numbers. State
   which revision or working-tree state they describe. Label redactions and gaps;
   snippets must not imply that omitted code was inspected or is absent.
-- Keep the complete prompt within 100000 UTF-8 bytes, including the question,
+- Keep the complete prompt within 200000 UTF-8 bytes, including the question,
   labels and constraints. Reduce irrelevant context explicitly; never silently
   truncate. If necessary evidence cannot fit or cannot safely be shared, report
   the limitation and request a narrower decision or additional authorization.
@@ -230,6 +230,20 @@ from this repository. Use the model and effort required by your own instructions
   "effort": "high"
 }
 ```
+
+The 200,000-byte input allowance covers the complete supplied prompt, including
+the question, labels and source excerpts. It is separate from the cumulative
+1 MiB CLI stdout guard, response length and request deadline; bytes are not a
+model-context token guarantee. More input room does not establish complete source
+coverage or prevent timeouts. If necessary evidence still cannot fit, disclose
+the coverage gap and narrow the authorized question before calling rather than
+claiming omitted persistence, replay or other critical paths were assessed.
+
+After an upgrade from the earlier 100,000-byte limit, rebuild this checkout and
+refresh the affected MCP connection when idle to load the new input schema.
+Update any separately installed skill and applicable project prompt-budget rule
+to match; a repository update alone does not update those copies. Do not interrupt
+active calls or discard session-retained answers merely to refresh the limit.
 
 The wrapper validates the prompt's size and shape, but cannot establish that it is
 sanitized, sufficient, current or correctly attributed. Codex owns those checks.
