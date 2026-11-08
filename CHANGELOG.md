@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Raise the complete prompt allowance from 100,000 to 200,000 UTF-8 bytes and align the consultation skill and context guidance; retain output limits, deadlines, settings verification and explicit coverage limitations.
+
 - Bundle an optional project-scoped `claude-consult` Codex skill for sanitized task context, argument selection, retained-response coverage and evidence reconciliation; document project installation while preserving existing MCP and project-policy boundaries.
 
 - Add validated CLI-reported terminal status and correlated preceding assistant-error categories with explicit availability states to failure diagnostics; keep raw errors private and preserve assessment rejection, settings verification, first-failure snapshots and existing lifecycle limits.
