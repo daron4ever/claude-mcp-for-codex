@@ -2,6 +2,7 @@
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
 
 const fixtureOptions = {};
 const args = process.argv.slice(2);
@@ -83,6 +84,13 @@ function answer(text, fields = {}, initAlreadySent = false) {
   if (fault() === "result-then-invalid") process.stdout.write("synthetic-sensitive-invalid-json\n");
 }
 function runPrompt() {
+  if (fixtureOptions.digestPrompt) {
+    answer(JSON.stringify({
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+      promptSha256: createHash("sha256").update(prompt, "utf8").digest("hex"),
+    }));
+    return;
+  }
   switch (request.scenario) {
     case "progress":
       emit({ type: "system", subtype: "init", session_id: session });

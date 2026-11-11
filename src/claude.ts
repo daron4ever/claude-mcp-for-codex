@@ -14,11 +14,11 @@ export const inputSchema = z.object({
   prompt: z
     .string()
     .min(1)
-    .max(200_000)
+    .max(1_000_000)
     .refine((value) => value.trim().length > 0, "Prompt must not be blank")
     .refine(
-      (value) => Buffer.byteLength(value, "utf8") <= 200_000,
-      "Prompt must not exceed 200000 UTF-8 bytes",
+      (value) => Buffer.byteLength(value, "utf8") <= 1_000_000,
+      "Prompt must not exceed 1000000 UTF-8 bytes",
     )
     .describe("Question and any explicitly supplied, sanitized context for Claude."),
   model: modelSchema.optional()
