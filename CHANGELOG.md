@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Refresh the locked Hono and Hono Node server dependencies to patched compatible releases, clearing dependency audit findings without changing the MCP SDK or CI security gates.
+
 - Raise the complete prompt allowance to 2,000,000 UTF-8 bytes and the bounded MCP stdin buffer to 16 MiB for JSON escaping; align consultation guidance and validate Unicode, escaped input and transport overflow while retaining output limits, deadlines, settings verification and explicit coverage limitations.
 
 - Bundle an optional project-scoped `claude-consult` Codex skill for sanitized task context, argument selection, retained-response coverage and evidence reconciliation; document project installation while preserving existing MCP and project-policy boundaries.
