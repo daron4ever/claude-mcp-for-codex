@@ -47,7 +47,7 @@ test("stdio MCP preserves a complete 200000-byte Unicode prompt and rejects over
   const { client, directory } = await connect(t);
   const { tools } = await client.listTools();
   assert.equal(tools.find(tool => tool.name === "ask_claude").inputSchema.properties.prompt.maxLength,
-    1_000_000);
+    2_000_000);
   const prompt = "한".repeat(66_666) + "ab";
   assert.equal(Buffer.byteLength(prompt, "utf8"), 200_000);
   const result = await client.callTool({ name: "ask_claude", arguments: {
@@ -63,9 +63,9 @@ test("stdio MCP preserves a complete 200000-byte Unicode prompt and rejects over
   const trace = resolve(directory, "must-not-exist");
   const request = { scenario: "inspect", trace, payload: "" };
   const overhead = Buffer.byteLength(JSON.stringify(request), "utf8");
-  request.payload = "x".repeat(1_000_001 - overhead);
+  request.payload = "x".repeat(2_000_001 - overhead);
   const oversized = JSON.stringify(request);
-  assert.equal(Buffer.byteLength(oversized, "utf8"), 1_000_001);
+  assert.equal(Buffer.byteLength(oversized, "utf8"), 2_000_001);
   const rejected = await client.callTool({ name: "ask_claude", arguments: { prompt: oversized } });
   assert.equal(rejected.isError, true);
   assert.equal(rejected.structuredContent, undefined);
@@ -74,16 +74,16 @@ test("stdio MCP preserves a complete 200000-byte Unicode prompt and rejects over
   assert.equal(next.content[0].text, "still usable");
 });
 
-test("stdio MCP forwards 1000000-byte Unicode and escaped prompts without enlarging output", async t => {
+test("stdio MCP forwards 2000000-byte Unicode and escaped prompts without enlarging output", async t => {
   const { client } = await connect(t, {}, { digestPrompt: true });
-  for (const prompt of ["한".repeat(333_333) + "a", "\0".repeat(1_000_000)]) {
-    assert.equal(Buffer.byteLength(prompt, "utf8"), 1_000_000);
+  for (const prompt of ["한".repeat(666_666) + "ab", "\0".repeat(2_000_000)]) {
+    assert.equal(Buffer.byteLength(prompt, "utf8"), 2_000_000);
     const result = await client.callTool({ name: "ask_claude", arguments: {
       prompt, model: "opus", effort: "xhigh",
     } });
     assert.ok(!result.isError);
     const expected = {
-      promptBytes: 1_000_000,
+      promptBytes: 2_000_000,
       promptSha256: createHash("sha256").update(prompt, "utf8").digest("hex"),
     };
     assert.deepEqual(JSON.parse(result.content[0].text), expected);
@@ -92,6 +92,18 @@ test("stdio MCP forwards 1000000-byte Unicode and escaped prompts without enlarg
     assert.equal(result.structuredContent.metadata.requestedEffort, "xhigh");
     assert.equal(result.structuredContent.metadata.settingsEvidence.status, "verified");
   }
+});
+
+test("stdio MCP rejects input frames over 16 MiB without executing the CLI", async t => {
+  const { client, directory } = await connect(t);
+  const trace = resolve(directory, "must-not-exist");
+  const prompt = JSON.stringify({ scenario: "inspect", trace,
+    payload: "x".repeat(16 * 1024 * 1024) });
+  // An SDK transport error can drop the frame without closing the process;
+  // keep the client's resulting timeout bounded instead of changing that behavior.
+  await assert.rejects(client.callTool({ name: "ask_claude", arguments: { prompt } },
+    undefined, { timeout: 3_000 }), error => [-32000, -32001].includes(error.code));
+  await assert.rejects(access(trace), { code: "ENOENT" });
 });
 
 test("MCP error diagnostics distinguish parse failures from declared CLI failures without leaking bodies", async t => {
