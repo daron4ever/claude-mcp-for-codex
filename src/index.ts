@@ -24,7 +24,10 @@ async function main(): Promise<void> {
   }
   process.stdin.once("end", () => { void stop(); });
   process.stdout.on("error", () => { void stop(); });
-  await server.connect(new StdioServerTransport());
+  // JSON escaping can expand a valid 2 MB prompt to 12 MB before framing.
+  await server.connect(new StdioServerTransport(process.stdin, process.stdout, {
+    maxBufferSize: 16 * 1024 * 1024,
+  }));
 }
 
 main().catch(() => {

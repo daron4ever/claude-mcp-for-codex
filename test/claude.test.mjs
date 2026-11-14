@@ -49,18 +49,18 @@ test("optional configured model and effort defaults validate without echoing inv
 });
 
 test("tool input limits UTF-8 bytes and rejects empty prompts and flag-like models", () => {
-  for (const prompt of ["", " \n\t", "x".repeat(1_000_001), "한".repeat(333_333) + "ab",
-    "🌱".repeat(250_000) + "x"]) {
+  for (const prompt of ["", " \n\t", "x".repeat(2_000_001), "한".repeat(666_667),
+    "🌱".repeat(500_000) + "x"]) {
     assert.equal(inputSchema.safeParse({ prompt }).success, false);
   }
   assert.equal(inputSchema.safeParse({ prompt: "hi", model: "--tools" }).success, false);
   assert.deepEqual(inputSchema.parse({ prompt: "hi" }), { prompt: "hi" });
 });
 
-test("complete prompts at the 1000000-byte ASCII and multibyte boundary are accepted", () => {
-  for (const prompt of ["x".repeat(1_000_000), "한".repeat(333_333) + "a",
-    "🌱".repeat(250_000)]) {
-    assert.equal(Buffer.byteLength(prompt, "utf8"), 1_000_000);
+test("complete prompts at the 2000000-byte ASCII and multibyte boundary are accepted", () => {
+  for (const prompt of ["x".repeat(2_000_000), "한".repeat(666_666) + "ab",
+    "🌱".repeat(500_000)]) {
+    assert.equal(Buffer.byteLength(prompt, "utf8"), 2_000_000);
     assert.deepEqual(inputSchema.parse({ prompt, model: "opus", effort: "xhigh" }),
       { prompt, model: "opus", effort: "xhigh" });
   }
@@ -69,7 +69,7 @@ test("complete prompts at the 1000000-byte ASCII and multibyte boundary are acce
 test("oversized prompts are rejected before the executable can start", async t => {
   const { directory } = await fixture(t);
   const runner = makeRunner(t, resolve(directory, "missing"));
-  for (const prompt of ["x".repeat(1_000_001), "한".repeat(333_333) + "ab"]) {
+  for (const prompt of ["x".repeat(2_000_001), "한".repeat(666_667)]) {
     await assert.rejects(runner.run({ prompt }, signal()), error => {
       assert.equal(error.name, "ZodError");
       assert.ok(error.issues.some(issue => issue.path.includes("prompt")));
